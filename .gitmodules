@@ -1,0 +1,3 @@
+[submodule "wikis"]
+	path = wikis
+	url = https://github.com/zelara-ai/app-desktop.wiki.git
