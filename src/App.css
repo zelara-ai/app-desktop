@@ -1,0 +1,260 @@
+:root {
+  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+  color: #0f0f0f;
+  background-color: #f6f6f6;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+.app {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: #f5f5f5;
+}
+
+.app-header {
+  background: #2c3e50;
+  color: white;
+  padding: 1.5rem 2rem;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.app-header h1 {
+  margin: 0 0 1rem 0;
+  font-size: 2rem;
+}
+
+.app-main {
+  flex: 1;
+  padding: 2rem;
+  max-width: 1200px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+section {
+  background: white;
+  border-radius: 8px;
+  padding: 1.5rem;
+  margin-bottom: 2rem;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+section h2 {
+  margin: 0 0 1.5rem 0;
+  color: #2c3e50;
+  font-size: 1.5rem;
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  font-size: 1.5rem;
+  color: #666;
+}
+
+/* Progress Display */
+.progress-display {
+  display: flex;
+  align-items: center;
+  gap: 2rem;
+}
+
+.points-counter {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+
+.points-value {
+  font-size: 2.5rem;
+  font-weight: bold;
+  color: #27ae60;
+}
+
+.points-label {
+  font-size: 1rem;
+  color: #ecf0f1;
+}
+
+.progress-bar-container {
+  flex: 1;
+  position: relative;
+  height: 30px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 15px;
+  overflow: hidden;
+}
+
+.progress-bar {
+  height: 100%;
+  background: linear-gradient(90deg, #27ae60, #2ecc71);
+  transition: width 0.3s ease;
+}
+
+.progress-label {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  color: white;
+  font-size: 0.9rem;
+  font-weight: 600;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
+}
+
+.available-unlocks {
+  background: #f39c12;
+  color: white;
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  font-size: 0.9rem;
+}
+
+/* Device Pairing */
+.device-pairing {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+.pairing-controls {
+  display: flex;
+  gap: 1rem;
+}
+
+.qr-display {
+  padding: 1rem;
+  background: #ecf0f1;
+  border-radius: 8px;
+}
+
+.qr-placeholder {
+  background: white;
+  padding: 2rem;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.linked-devices h3 {
+  margin: 0 0 1rem 0;
+  color: #2c3e50;
+}
+
+.linked-devices ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.linked-devices li {
+  padding: 0.75rem 1rem;
+  background: #ecf0f1;
+  border-radius: 6px;
+  margin-bottom: 0.5rem;
+}
+
+/* Module List */
+.module-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 1.5rem;
+}
+
+.module-card {
+  padding: 1.5rem;
+  border-radius: 8px;
+  border: 2px solid #e0e0e0;
+  transition: all 0.3s ease;
+}
+
+.module-card.unlocked {
+  border-color: #27ae60;
+  background: #f0f9f4;
+}
+
+.module-card.locked {
+  opacity: 0.6;
+}
+
+.module-card.available {
+  border-color: #f39c12;
+  background: #fef9e7;
+}
+
+.module-card h3 {
+  margin: 0 0 0.5rem 0;
+  color: #2c3e50;
+}
+
+.module-card p {
+  margin: 0 0 1rem 0;
+  color: #666;
+  font-size: 0.9rem;
+}
+
+.module-status {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.status-badge {
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.status-badge.unlocked {
+  background: #27ae60;
+  color: white;
+}
+
+.status-badge.locked {
+  background: #95a5a6;
+  color: white;
+}
+
+button {
+  padding: 0.75rem 1.5rem;
+  background: #3498db;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: background 0.3s ease;
+}
+
+button:hover:not(:disabled) {
+  background: #2980b9;
+}
+
+button:disabled {
+  background: #95a5a6;
+  cursor: not-allowed;
+}
+
+.unlock-button {
+  background: #f39c12;
+}
+
+.unlock-button:hover {
+  background: #e67e22;
+}
