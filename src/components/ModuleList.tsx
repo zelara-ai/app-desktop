@@ -1,4 +1,4 @@
-import { UserProgress, MODULES } from '@zelara/shared';
+import { UserProgress } from '@zelara/shared';
 
 interface ModuleListProps {
   progress: UserProgress;
