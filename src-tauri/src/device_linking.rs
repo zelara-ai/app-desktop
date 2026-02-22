@@ -40,7 +40,7 @@ pub struct TaskResponse {
 
 pub struct DeviceLinkingState {
     pub linked_devices: Mutex<Vec<DeviceInfo>>,
-    pub pairing_token: Mutex<Option<String>>,
+    pub pairing_token: Arc<Mutex<Option<String>>>,
     pub server_running: Arc<Mutex<bool>>,
 }
 
@@ -48,7 +48,7 @@ impl DeviceLinkingState {
     pub fn new() -> Self {
         Self {
             linked_devices: Mutex::new(Vec::new()),
-            pairing_token: Mutex::new(None),
+            pairing_token: Arc::new(Mutex::new(None)),
             server_running: Arc::new(Mutex::new(false)),
         }
     }

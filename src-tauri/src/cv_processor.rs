@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
+use base64::{engine::general_purpose, Engine as _};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ValidationResult {
@@ -35,7 +36,7 @@ pub async fn validate_recycling_image(
     // For now, return mock validation
 
     // Decode base64 image
-    let _image_bytes = base64::decode(&request.image_data)
+    let _image_bytes = general_purpose::STANDARD.decode(&request.image_data)
         .map_err(|e| format!("Failed to decode image: {}", e))?;
 
     // TODO: Run ONNX model inference
