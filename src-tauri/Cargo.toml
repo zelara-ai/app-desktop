@@ -26,7 +26,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-native-tls = "0.3"
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-ort = "2.0"  # ONNX Runtime
+# ort = "2.0.0-rc.11"  # ONNX Runtime - Disabled for now (using mock validation)
 qrcode = "0.14"
 image = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
