@@ -22,10 +22,16 @@ function DevicePairing() {
   const generateQR = async () => {
     setLoading(true);
     try {
+      // Start pairing server
+      await invoke('start_pairing_server');
+
+      // Generate QR code with pairing info
       const info = await invoke<PairingInfo>('generate_qr_code');
       setPairingInfo(info);
+
       // TODO: Generate actual QR code image from qr_data
       console.log('QR Data:', info.qr_data);
+      console.log('Server listening on:', `${info.ip_address}:${info.port}`);
     } catch (error) {
       console.error('Failed to generate QR code:', error);
     } finally {

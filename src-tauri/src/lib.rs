@@ -18,6 +18,8 @@ pub fn run() {
             device_linking::generate_qr_code,
             device_linking::get_linked_devices,
             device_linking::add_linked_device,
+            device_linking::start_pairing_server,
+            device_linking::stop_pairing_server,
             // CV processing commands
             cv_processor::validate_recycling_image,
             // Storage commands
