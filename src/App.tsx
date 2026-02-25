@@ -5,6 +5,7 @@ import './App.css';
 import DevicePairing from './components/DevicePairing';
 import ProgressDisplay from './components/ProgressDisplay';
 import ModuleList from './components/ModuleList';
+import TestingPanel from './components/TestingPanel';
 
 function App() {
   const [progress, setProgress] = useState<UserProgress | null>(null);
@@ -48,6 +49,10 @@ function App() {
         <section className="device-section">
           <h2>Device Linking</h2>
           <DevicePairing />
+        </section>
+
+        <section className="testing-section">
+          <TestingPanel />
         </section>
 
         <section className="modules-section">

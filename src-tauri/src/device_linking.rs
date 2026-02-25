@@ -6,6 +6,9 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 use local_ip_address::local_ip;
+use qrcode::QrCode;
+use image::Luma;
+use base64::{engine::general_purpose, Engine as _};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceInfo {
@@ -17,12 +20,14 @@ pub struct DeviceInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PairingInfo {
     pub qr_data: String,
+    pub qr_image: String, // Base64-encoded PNG image
     pub ip_address: String,
     pub port: u16,
     pub token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskRequest {
     pub task_id: String,
     pub task_type: String,
@@ -31,6 +36,7 @@ pub struct TaskRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TaskResponse {
     pub task_id: String,
     pub success: bool,
@@ -39,7 +45,7 @@ pub struct TaskResponse {
 }
 
 pub struct DeviceLinkingState {
-    pub linked_devices: Mutex<Vec<DeviceInfo>>,
+    pub linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     pub pairing_token: Arc<Mutex<Option<String>>>,
     pub server_running: Arc<Mutex<bool>>,
 }
@@ -47,7 +53,7 @@ pub struct DeviceLinkingState {
 impl DeviceLinkingState {
     pub fn new() -> Self {
         Self {
-            linked_devices: Mutex::new(Vec::new()),
+            linked_devices: Arc::new(Mutex::new(Vec::new())),
             pairing_token: Arc::new(Mutex::new(None)),
             server_running: Arc::new(Mutex::new(false)),
         }
@@ -73,11 +79,29 @@ pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo,
     // Create QR data
     let qr_data = format!("zelara://pair?ip={}&port={}&token={}", ip_address, port, token);
 
+    // Generate QR code image
+    let code = QrCode::new(qr_data.as_bytes())
+        .map_err(|e| format!("Failed to generate QR code: {}", e))?;
+
+    // Render to image with scale factor for better visibility
+    let image = code.render::<Luma<u8>>()
+        .min_dimensions(400, 400)
+        .build();
+
+    // Convert to PNG bytes
+    let mut png_bytes = Vec::new();
+    image.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+
+    // Encode as base64
+    let qr_image = general_purpose::STANDARD.encode(&png_bytes);
+
     // Store token
     *state.pairing_token.lock().unwrap() = Some(token.clone());
 
     Ok(PairingInfo {
         qr_data,
+        qr_image,
         ip_address,
         port,
         token,
@@ -118,10 +142,11 @@ pub async fn start_pairing_server(state: State<'_, DeviceLinkingState>) -> Resul
     // Clone Arc for async task
     let server_running = state.server_running.clone();
     let pairing_token = state.pairing_token.clone();
+    let linked_devices = state.linked_devices.clone();
 
     // Spawn server task
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&addr, server_running, pairing_token).await {
+        if let Err(e) = run_websocket_server(&addr, server_running, pairing_token, linked_devices).await {
             eprintln!("WebSocket server error: {}", e);
         }
     });
@@ -133,6 +158,7 @@ async fn run_websocket_server(
     addr: &str,
     server_running: Arc<Mutex<bool>>,
     pairing_token: Arc<Mutex<Option<String>>>,
+    linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
@@ -147,11 +173,13 @@ async fn run_websocket_server(
 
                 // Clone for async task
                 let token = pairing_token.lock().unwrap().clone();
+                let devices = linked_devices.clone();
+                let remote_addr = addr.to_string();
 
                 tokio::spawn(async move {
                     match accept_async(stream).await {
                         Ok(ws_stream) => {
-                            if let Err(e) = handle_websocket_connection(ws_stream, token).await {
+                            if let Err(e) = handle_websocket_connection(ws_stream, token, devices, remote_addr).await {
                                 eprintln!("WebSocket connection error: {}", e);
                             }
                         }
@@ -173,8 +201,11 @@ async fn run_websocket_server(
 async fn handle_websocket_connection(
     ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
     expected_token: Option<String>,
+    linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    remote_addr: String,
 ) -> Result<(), String> {
     let (mut write, mut read) = ws_stream.split();
+    let mut device_registered = false;
 
     while let Some(message) = read.next().await {
         match message {
@@ -201,6 +232,23 @@ async fn handle_websocket_connection(
                             .map_err(|e| format!("Failed to send response: {}", e))?;
                         return Err("Invalid token".to_string());
                     }
+
+                    // Register device after successful token verification
+                    if !device_registered {
+                        let device = DeviceInfo {
+                            id: format!("mobile_{}", chrono::Utc::now().timestamp()),
+                            name: format!("Mobile ({})", remote_addr),
+                            platform: "mobile".to_string(),
+                        };
+
+                        let mut devices = linked_devices.lock().unwrap();
+                        // Don't add duplicate devices
+                        if !devices.iter().any(|d| d.name == device.name) {
+                            devices.push(device);
+                            println!("Registered mobile device: {}", remote_addr);
+                        }
+                        device_registered = true;
+                    }
                 }
 
                 // Process task based on type
@@ -208,19 +256,69 @@ async fn handle_websocket_connection(
                     "image_validation" => {
                         // Extract image data
                         if let Some(image_data) = request.payload.get("imageData").and_then(|d| d.as_str()) {
-                            // TODO: Call cv_processor to validate image
-                            // For now, return mock success
                             println!("Received image data: {} bytes", image_data.len());
 
+                            // Call CV processor for actual validation
+                            match crate::cv_processor::validate_image(image_data) {
+                                Ok(result) => {
+                                    println!("CV validation: success={}, confidence={}", result.success, result.confidence);
+                                    TaskResponse {
+                                        task_id: request.task_id,
+                                        success: result.success,
+                                        result: serde_json::json!({
+                                            "success": result.success,
+                                            "confidence": result.confidence,
+                                            "message": result.message
+                                        }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("CV validation error: {}", e);
+                                    TaskResponse {
+                                        task_id: request.task_id,
+                                        success: false,
+                                        result: serde_json::json!({ "error": format!("Validation failed: {}", e) }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }
+                                }
+                            }
+                        } else {
                             TaskResponse {
                                 task_id: request.task_id,
-                                success: true,
-                                result: serde_json::json!({
-                                    "success": true,
-                                    "confidence": 0.85,
-                                    "message": "Paper bag with recyclable items detected"
-                                }),
+                                success: false,
+                                result: serde_json::json!({ "error": "Missing image data" }),
                                 timestamp: chrono::Utc::now().to_rfc3339(),
+                            }
+                        }
+                    }
+                    "image_inversion_test" => {
+                        // Test feature: Invert image colors and send back
+                        if let Some(image_data) = request.payload.get("imageData").and_then(|d| d.as_str()) {
+                            println!("Received image for inversion test: {} bytes", image_data.len());
+
+                            match invert_image(image_data) {
+                                Ok(inverted_image) => {
+                                    println!("Image inverted successfully");
+                                    TaskResponse {
+                                        task_id: request.task_id,
+                                        success: true,
+                                        result: serde_json::json!({
+                                            "invertedImage": inverted_image,
+                                            "message": "Image inverted successfully"
+                                        }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Image inversion error: {}", e);
+                                    TaskResponse {
+                                        task_id: request.task_id,
+                                        success: false,
+                                        result: serde_json::json!({ "error": format!("Inversion failed: {}", e) }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }
+                                }
                             }
                         } else {
                             TaskResponse {
@@ -262,6 +360,33 @@ async fn handle_websocket_connection(
     }
 
     Ok(())
+}
+
+/// Invert image colors (test feature)
+fn invert_image(base64_image: &str) -> Result<String, String> {
+    use base64::{engine::general_purpose, Engine as _};
+    use image::ImageFormat;
+
+    // Decode base64 image
+    let image_bytes = general_purpose::STANDARD.decode(base64_image)
+        .map_err(|e| format!("Failed to decode image: {}", e))?;
+
+    // Load image from bytes
+    let mut img = image::load_from_memory(&image_bytes)
+        .map_err(|e| format!("Failed to load image: {}", e))?;
+
+    // Invert colors
+    img.invert();
+
+    // Encode back to PNG bytes
+    let mut output_bytes = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut output_bytes), ImageFormat::Png)
+        .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+
+    // Encode to base64
+    let inverted_base64 = general_purpose::STANDARD.encode(&output_bytes);
+
+    Ok(inverted_base64)
 }
 
 #[tauri::command]

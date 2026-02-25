@@ -1,0 +1,149 @@
+.testing-panel {
+  padding: 24px;
+  max-width: 800px;
+}
+
+.testing-header {
+  margin-bottom: 24px;
+}
+
+.testing-header h2 {
+  font-size: 24px;
+  font-weight: bold;
+  color: #2c3e50;
+  margin: 0 0 8px 0;
+}
+
+.testing-subtitle {
+  font-size: 14px;
+  color: #666;
+  margin: 0;
+}
+
+.testing-section {
+  background-color: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.testing-section h3 {
+  font-size: 18px;
+  font-weight: bold;
+  color: #2c3e50;
+  margin: 0 0 12px 0;
+}
+
+.section-description {
+  font-size: 14px;
+  color: #666;
+  margin: 0 0 12px 0;
+  line-height: 1.5;
+}
+
+.status-row {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.status-indicator {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  margin-right: 8px;
+}
+
+.status-indicator.running,
+.status-indicator.connected {
+  background-color: #27ae60;
+}
+
+.status-indicator.stopped,
+.status-indicator.disconnected {
+  background-color: #e74c3c;
+}
+
+.status-text {
+  font-size: 16px;
+  color: #2c3e50;
+}
+
+.test-button {
+  padding: 12px 24px;
+  border: none;
+  border-radius: 6px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+
+.test-button.primary {
+  background-color: #9b59b6;
+  color: white;
+}
+
+.test-button.primary:hover {
+  background-color: #8e44ad;
+}
+
+.test-button.secondary {
+  background-color: #3498db;
+  color: white;
+}
+
+.test-button.secondary:hover {
+  background-color: #2980b9;
+}
+
+.test-button:disabled {
+  background-color: #bdc3c7;
+  cursor: not-allowed;
+}
+
+.test-log {
+  background-color: #f9f9f9;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  padding: 12px;
+  max-height: 200px;
+  overflow-y: auto;
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+}
+
+.log-empty {
+  color: #999;
+  font-style: italic;
+  text-align: center;
+  padding: 20px;
+}
+
+.log-entry {
+  color: #2c3e50;
+  margin-bottom: 4px;
+  line-height: 1.4;
+}
+
+.testing-info {
+  background-color: #e8f5e9;
+  border: 1px solid #27ae60;
+  border-radius: 8px;
+  padding: 16px;
+}
+
+.testing-info h4 {
+  font-size: 16px;
+  font-weight: bold;
+  color: #27ae60;
+  margin: 0 0 8px 0;
+}
+
+.testing-info p {
+  font-size: 14px;
+  color: #2c3e50;
+  margin: 0;
+  line-height: 1.5;
+}

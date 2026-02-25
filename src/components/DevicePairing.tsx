@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 interface PairingInfo {
   qr_data: string;
+  qr_image: string; // Base64-encoded PNG
   ip_address: string;
   port: number;
   token: string;
@@ -29,8 +30,7 @@ function DevicePairing() {
       const info = await invoke<PairingInfo>('generate_qr_code');
       setPairingInfo(info);
 
-      // TODO: Generate actual QR code image from qr_data
-      console.log('QR Data:', info.qr_data);
+      console.log('QR Code generated');
       console.log('Server listening on:', `${info.ip_address}:${info.port}`);
     } catch (error) {
       console.error('Failed to generate QR code:', error);
@@ -60,10 +60,16 @@ function DevicePairing() {
       {pairingInfo && (
         <div className="qr-display">
           <h3>Scan this QR code with your mobile device</h3>
-          <div className="qr-placeholder">
-            {/* TODO: Render actual QR code */}
-            <p>QR Code: {pairingInfo.qr_data}</p>
-            <p>IP: {pairingInfo.ip_address}:{pairingInfo.port}</p>
+          <div className="qr-code">
+            <img
+              src={`data:image/png;base64,${pairingInfo.qr_image}`}
+              alt="QR Code for device pairing"
+              style={{ width: '400px', height: '400px', border: '2px solid #ccc', borderRadius: '8px' }}
+            />
+          </div>
+          <div className="pairing-details">
+            <p><strong>Server:</strong> {pairingInfo.ip_address}:{pairingInfo.port}</p>
+            <p style={{ fontSize: '12px', color: '#666' }}>Open Zelara mobile app and scan this code to connect</p>
           </div>
         </div>
       )}
