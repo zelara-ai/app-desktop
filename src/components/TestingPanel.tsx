@@ -1,45 +1,55 @@
 import React, { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import './TestingPanel.css';
 
-interface ConnectionInfo {
-  isRunning: boolean;
-  connectedDevices: number;
-  port: number;
+interface DeviceInfo {
+  id: string;
+  name: string;
+  platform: string;
+}
+
+interface InversionResult {
+  original: string;
+  inverted: string;
+  device: string;
+  timestamp: string;
 }
 
 const TestingPanel: React.FC = () => {
-  const [connectionInfo, setConnectionInfo] = useState<ConnectionInfo>({
-    isRunning: false,
-    connectedDevices: 0,
-    port: 8765,
-  });
+  const [serverRunning] = useState(true); // Server is started when QR is generated
+  const [connectedDevices, setConnectedDevices] = useState(0);
   const [testLog, setTestLog] = useState<string[]>([]);
+  const [lastResult, setLastResult] = useState<InversionResult | null>(null);
 
   useEffect(() => {
-    // In a real implementation, this would query the Tauri backend
-    // For now, we'll simulate the connection status
-    const checkConnection = () => {
-      // This would call a Tauri command to get actual status
-      setConnectionInfo({
-        isRunning: true,
-        connectedDevices: 0, // Would be populated by backend
-        port: 8765,
-      });
+    // Load current device count from backend
+    invoke<DeviceInfo[]>('get_linked_devices')
+      .then((devices) => setConnectedDevices(devices.length))
+      .catch(() => {});
+
+    const unlisteners: Array<() => void> = [];
+
+    // Update device count when a new device links
+    listen<DeviceInfo>('device-linked', (event) => {
+      setConnectedDevices((prev) => prev + 1);
+      addLogEntry(`Device linked: ${event.payload.name}`);
+    }).then((fn) => unlisteners.push(fn));
+
+    // Display image inversion results sent from mobile
+    listen<InversionResult>('image-inversion-result', (event) => {
+      setLastResult(event.payload);
+      addLogEntry(`Image inversion test received from ${event.payload.device}`);
+    }).then((fn) => unlisteners.push(fn));
+
+    return () => {
+      unlisteners.forEach((fn) => fn());
     };
-
-    checkConnection();
-    const interval = setInterval(checkConnection, 5000);
-
-    return () => clearInterval(interval);
   }, []);
 
   const addLogEntry = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
     setTestLog(prev => [`[${timestamp}] ${message}`, ...prev].slice(0, 50));
-  };
-
-  const simulateTest = () => {
-    addLogEntry('Simulated test initiated - this would test device communication in production');
   };
 
   return (
@@ -52,15 +62,15 @@ const TestingPanel: React.FC = () => {
       <div className="testing-section">
         <h3>WebSocket Server Status</h3>
         <div className="status-row">
-          <div className={`status-indicator ${connectionInfo.isRunning ? 'running' : 'stopped'}`} />
+          <div className={`status-indicator ${serverRunning ? 'running' : 'stopped'}`} />
           <span className="status-text">
-            {connectionInfo.isRunning ? `Running on port ${connectionInfo.port}` : 'Stopped'}
+            {serverRunning ? 'Running on port 8765' : 'Stopped'}
           </span>
         </div>
         <div className="status-row">
-          <div className={`status-indicator ${connectionInfo.connectedDevices > 0 ? 'connected' : 'disconnected'}`} />
+          <div className={`status-indicator ${connectedDevices > 0 ? 'connected' : 'disconnected'}`} />
           <span className="status-text">
-            {connectionInfo.connectedDevices} connected device(s)
+            {connectedDevices} connected device(s)
           </span>
         </div>
       </div>
@@ -68,15 +78,35 @@ const TestingPanel: React.FC = () => {
       <div className="testing-section">
         <h3>Image Processing Tests</h3>
         <p className="section-description">
-          Tests are initiated from mobile devices. When a mobile device sends an image inversion
-          request, it will be processed by this Desktop application and the result sent back.
+          Tests are initiated from mobile devices. Use the Testing screen on mobile to take a
+          photo — it will be sent here, inverted, and the result will appear on both devices.
         </p>
-        <button
-          className="test-button secondary"
-          onClick={simulateTest}>
-          Simulate Test (Dev Only)
-        </button>
       </div>
+
+      {lastResult && (
+        <div className="test-result-display">
+          <h3>Last Inversion Test</h3>
+          <p className="test-result-meta">
+            From: {lastResult.device} &nbsp;&middot;&nbsp; {new Date(lastResult.timestamp).toLocaleTimeString()}
+          </p>
+          <div className="image-comparison">
+            <div className="image-comparison-item">
+              <p>Original</p>
+              <img
+                src={`data:image/jpeg;base64,${lastResult.original}`}
+                alt="Original photo from mobile"
+              />
+            </div>
+            <div className="image-comparison-item">
+              <p>Inverted</p>
+              <img
+                src={`data:image/png;base64,${lastResult.inverted}`}
+                alt="Inverted result"
+              />
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="testing-section">
         <h3>Test Log</h3>

@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 interface PairingInfo {
   qr_data: string;
@@ -20,6 +21,26 @@ function DevicePairing() {
   const [pairingInfo, setPairingInfo] = useState<PairingInfo | null>(null);
   const [linkedDevices, setLinkedDevices] = useState<DeviceInfo[]>([]);
   const [loading, setLoading] = useState(false);
+
+  // Load existing devices on mount and listen for new ones in real time
+  useEffect(() => {
+    loadLinkedDevices();
+
+    let unlisten: (() => void) | undefined;
+
+    listen<DeviceInfo>('device-linked', (event) => {
+      setLinkedDevices((prev) => {
+        if (prev.some((d) => d.name === event.payload.name)) return prev;
+        return [...prev, event.payload];
+      });
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
 
   const generateQR = async () => {
     setLoading(true);

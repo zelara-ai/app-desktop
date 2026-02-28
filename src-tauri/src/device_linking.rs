@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
-use tauri::State;
+use tauri::{Emitter, State};
 use tokio::net::TcpListener;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -152,7 +152,10 @@ pub fn add_linked_device(
 }
 
 #[tauri::command]
-pub async fn start_pairing_server(state: State<'_, DeviceLinkingState>) -> Result<(), String> {
+pub async fn start_pairing_server(
+    app_handle: tauri::AppHandle,
+    state: State<'_, DeviceLinkingState>,
+) -> Result<(), String> {
     // Check if server is already running
     {
         let running = state.server_running.lock().unwrap();
@@ -197,7 +200,7 @@ pub async fn start_pairing_server(state: State<'_, DeviceLinkingState>) -> Resul
 
     // Spawn server task
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&addr, server_running, pairing_token, linked_devices).await {
+        if let Err(e) = run_websocket_server(&addr, server_running, pairing_token, linked_devices, app_handle).await {
             eprintln!("WebSocket server error: {}", e);
         }
     });
@@ -210,6 +213,7 @@ async fn run_websocket_server(
     server_running: Arc<Mutex<bool>>,
     pairing_token: Arc<Mutex<Option<String>>>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
@@ -226,11 +230,12 @@ async fn run_websocket_server(
                 let token = pairing_token.lock().unwrap().clone();
                 let devices = linked_devices.clone();
                 let remote_addr = addr.to_string();
+                let handle = app_handle.clone();
 
                 tokio::spawn(async move {
                     match accept_async(stream).await {
                         Ok(ws_stream) => {
-                            if let Err(e) = handle_websocket_connection(ws_stream, token, devices, remote_addr).await {
+                            if let Err(e) = handle_websocket_connection(ws_stream, token, devices, remote_addr, handle).await {
                                 eprintln!("WebSocket connection error: {}", e);
                             }
                         }
@@ -254,6 +259,7 @@ async fn handle_websocket_connection(
     expected_token: Option<String>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     remote_addr: String,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let (mut write, mut read) = ws_stream.split();
     let mut device_registered = false;
@@ -295,8 +301,10 @@ async fn handle_websocket_connection(
                         let mut devices = linked_devices.lock().unwrap();
                         // Don't add duplicate devices
                         if !devices.iter().any(|d| d.name == device.name) {
-                            devices.push(device);
+                            devices.push(device.clone());
                             println!("Registered mobile device: {}", remote_addr);
+                            // Push update to the frontend immediately
+                            let _ = app_handle.emit("device-linked", &device);
                         }
                         device_registered = true;
                     }
@@ -351,6 +359,13 @@ async fn handle_websocket_connection(
                             match invert_image(image_data) {
                                 Ok(inverted_image) => {
                                     println!("Image inverted successfully");
+                                    // Notify the desktop UI so it can display both images
+                                    let _ = app_handle.emit("image-inversion-result", serde_json::json!({
+                                        "original": image_data,
+                                        "inverted": inverted_image,
+                                        "device": remote_addr,
+                                        "timestamp": chrono::Utc::now().to_rfc3339()
+                                    }));
                                     TaskResponse {
                                         task_id: request.task_id,
                                         success: true,
