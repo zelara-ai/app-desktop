@@ -21,7 +21,8 @@ pub struct DeviceInfo {
 pub struct PairingInfo {
     pub qr_data: String,
     pub qr_image: String, // Base64-encoded PNG image
-    pub ip_address: String,
+    pub ip_address: String,        // Primary IP for display
+    pub ip_addresses: Vec<String>, // All non-loopback IPs
     pub port: u16,
     pub token: String,
 }
@@ -60,11 +61,30 @@ impl DeviceLinkingState {
     }
 }
 
-/// Get local IP address
+/// Get primary local IP address
 fn get_local_ip() -> Result<String, String> {
     local_ip()
         .map(|ip| ip.to_string())
         .map_err(|e| format!("Failed to get local IP: {}", e))
+}
+
+/// Get all non-loopback IPv4 addresses across all interfaces
+fn get_all_local_ips() -> Vec<String> {
+    match if_addrs::get_if_addrs() {
+        Ok(interfaces) => interfaces
+            .into_iter()
+            .filter_map(|iface| {
+                // Keep only IPv4, non-loopback, non-link-local addresses
+                if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                    if !v4.ip.is_loopback() && !v4.ip.is_link_local() {
+                        return Some(v4.ip.to_string());
+                    }
+                }
+                None
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[tauri::command]
@@ -72,12 +92,20 @@ pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo,
     // Generate pairing token
     let token = format!("token_{}", uuid::Uuid::new_v4());
 
-    // Get actual local IP
+    // Get primary IP for display, plus all IPs for QR code
     let ip_address = get_local_ip()?;
+    let mut ip_addresses = get_all_local_ips();
+
+    // Ensure primary IP is always present (fallback if enumeration fails)
+    if ip_addresses.is_empty() {
+        ip_addresses.push(ip_address.clone());
+    }
+
     let port = 8765;
 
-    // Create QR data
-    let qr_data = format!("zelara://pair?ip={}&port={}&token={}", ip_address, port, token);
+    // Encode all IPs comma-separated so mobile can try each one
+    let ips_encoded = ip_addresses.join(",");
+    let qr_data = format!("zelara://pair?ips={}&port={}&token={}", ips_encoded, port, token);
 
     // Generate QR code image
     let code = QrCode::new(qr_data.as_bytes())
@@ -103,6 +131,7 @@ pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo,
         qr_data,
         qr_image,
         ip_address,
+        ip_addresses,
         port,
         token,
     })
@@ -135,9 +164,31 @@ pub async fn start_pairing_server(state: State<'_, DeviceLinkingState>) -> Resul
     // Mark server as running
     *state.server_running.lock().unwrap() = true;
 
-    // Get local IP
-    let ip = get_local_ip()?;
-    let addr = format!("{}:8765", ip);
+    // Ensure Windows Firewall allows inbound on port 8765.
+    // Check if the rule exists first; if not, request elevation once via UAC.
+    #[cfg(target_os = "windows")]
+    {
+        let rule_exists = std::process::Command::new("netsh")
+            .args(["advfirewall", "firewall", "show", "rule", "name=Zelara Device Linking"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !rule_exists {
+            // Spawn netsh elevated via PowerShell Start-Process -Verb RunAs.
+            // This shows a one-time UAC prompt; once the rule exists it is never shown again.
+            let _ = std::process::Command::new("powershell")
+                .args([
+                    "-WindowStyle", "Hidden",
+                    "-Command",
+                    "Start-Process netsh -ArgumentList 'advfirewall firewall add rule name=\"Zelara Device Linking\" dir=in action=allow protocol=TCP localport=8765' -Verb RunAs -Wait",
+                ])
+                .output();
+        }
+    }
+
+    // Bind to all interfaces so connections work on any network (WiFi, hotspot, etc.)
+    let addr = "0.0.0.0:8765".to_string();
 
     // Clone Arc for async task
     let server_running = state.server_running.clone();

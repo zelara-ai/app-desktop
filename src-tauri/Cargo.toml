@@ -35,4 +35,5 @@ base64 = "0.22"
 chrono = "0.4"
 dirs = "5.0"
 local-ip-address = "0.6"
+if-addrs = "0.13"
 

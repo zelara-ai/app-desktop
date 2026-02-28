@@ -5,6 +5,7 @@ interface PairingInfo {
   qr_data: string;
   qr_image: string; // Base64-encoded PNG
   ip_address: string;
+  ip_addresses: string[];
   port: number;
   token: string;
 }
@@ -68,8 +69,16 @@ function DevicePairing() {
             />
           </div>
           <div className="pairing-details">
-            <p><strong>Server:</strong> {pairingInfo.ip_address}:{pairingInfo.port}</p>
-            <p style={{ fontSize: '12px', color: '#666' }}>Open Zelara mobile app and scan this code to connect</p>
+            <p><strong>Server listening on all interfaces — port {pairingInfo.port}</strong></p>
+            <p style={{ fontSize: '13px', color: '#444' }}>
+              Available IPs:{' '}
+              {pairingInfo.ip_addresses.length > 0
+                ? pairingInfo.ip_addresses.join(', ')
+                : pairingInfo.ip_address}
+            </p>
+            <p style={{ fontSize: '12px', color: '#666' }}>
+              Mobile will auto-try each IP. Both devices must be on the same WiFi or hotspot.
+            </p>
           </div>
         </div>
       )}
