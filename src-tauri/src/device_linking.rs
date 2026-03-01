@@ -395,6 +395,24 @@ async fn handle_websocket_connection(
                             }
                         }
                     }
+                    "counter_update" => {
+                        if let Some(value) = request.payload.get("value").and_then(|v| v.as_i64()) {
+                            let _ = app_handle.emit("counter-update", serde_json::json!({ "value": value }));
+                            TaskResponse {
+                                task_id: request.task_id,
+                                success: true,
+                                result: serde_json::json!({ "received": value }),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            }
+                        } else {
+                            TaskResponse {
+                                task_id: request.task_id,
+                                success: false,
+                                result: serde_json::json!({ "error": "Missing or invalid counter value" }),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            }
+                        }
+                    }
                     _ => {
                         TaskResponse {
                             task_id: request.task_id,

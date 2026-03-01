@@ -21,12 +21,19 @@ const TestingPanel: React.FC = () => {
   const [connectedDevices, setConnectedDevices] = useState(0);
   const [testLog, setTestLog] = useState<string[]>([]);
   const [lastResult, setLastResult] = useState<InversionResult | null>(null);
+  const [currentTime, setCurrentTime] = useState(new Date().toLocaleTimeString());
+  const [counter, setCounter] = useState<number | null>(null);
 
   useEffect(() => {
     // Load current device count from backend
     invoke<DeviceInfo[]>('get_linked_devices')
       .then((devices) => setConnectedDevices(devices.length))
       .catch(() => {});
+
+    // Clock — updates every second
+    const clockInterval = setInterval(() => {
+      setCurrentTime(new Date().toLocaleTimeString());
+    }, 1000);
 
     const unlisteners: Array<() => void> = [];
 
@@ -42,7 +49,13 @@ const TestingPanel: React.FC = () => {
       addLogEntry(`Image inversion test received from ${event.payload.device}`);
     }).then((fn) => unlisteners.push(fn));
 
+    // Counter sent from mobile every second
+    listen<{ value: number }>('counter-update', (event) => {
+      setCounter(event.payload.value);
+    }).then((fn) => unlisteners.push(fn));
+
     return () => {
+      clearInterval(clockInterval);
       unlisteners.forEach((fn) => fn());
     };
   }, []);
@@ -57,6 +70,22 @@ const TestingPanel: React.FC = () => {
       <div className="testing-header">
         <h2>Testing Module</h2>
         <p className="testing-subtitle">Diagnostic tools for device communication</p>
+      </div>
+
+      <div className="testing-section testing-section--row">
+        <div className="testing-live-item">
+          <h3>Desktop Clock</h3>
+          <div className="clock-display">{currentTime}</div>
+        </div>
+        <div className="testing-live-item">
+          <h3>Mobile Counter</h3>
+          <div className="counter-display">
+            {counter !== null ? counter : '—'}
+          </div>
+          <p className="section-description">
+            Auto-sent from mobile every second while connected
+          </p>
+        </div>
       </div>
 
       <div className="testing-section">
