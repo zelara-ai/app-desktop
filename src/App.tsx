@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { UserProgress } from '@zelara/shared';
 import './App.css';
 import DevicePairing from './components/DevicePairing';
@@ -10,9 +11,25 @@ import TestingPanel from './components/TestingPanel';
 function App() {
   const [progress, setProgress] = useState<UserProgress | null>(null);
   const [loading, setLoading] = useState(true);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   useEffect(() => {
     loadProgress();
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    listen<{ id: string; name: string; platform: string }>('device-linked', (event) => {
+      setToastMessage(`Device linked: ${event.payload.name}`);
+      setTimeout(() => setToastMessage(null), 3000);
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
+    return () => {
+      unlisten?.();
+    };
   }, []);
 
   const loadProgress = async () => {
@@ -65,6 +82,9 @@ function App() {
           )}
         </section>
       </main>
+      {toastMessage && (
+        <div className="toast-notification">{toastMessage}</div>
+      )}
     </div>
   );
 }

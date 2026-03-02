@@ -413,6 +413,14 @@ async fn handle_websocket_connection(
                             }
                         }
                     }
+                    "handshake" => {
+                        TaskResponse {
+                            task_id: request.task_id,
+                            success: true,
+                            result: serde_json::json!({ "message": "Handshake successful" }),
+                            timestamp: chrono::Utc::now().to_rfc3339(),
+                        }
+                    }
                     _ => {
                         TaskResponse {
                             task_id: request.task_id,
