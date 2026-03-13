@@ -197,3 +197,142 @@
   border-radius: 8px;
   background-color: #f9f9f9;
 }
+
+.testing-section--row {
+  display: flex;
+  gap: 24px;
+}
+
+.testing-live-item {
+  flex: 1;
+}
+
+.clock-display {
+  font-size: 2rem;
+  font-weight: bold;
+  color: #2c3e50;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+
+.counter-display {
+  font-size: 2.5rem;
+  font-weight: bold;
+  color: #9b59b6;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 4px;
+}
+
+/* ── Bluetooth Discovery Test ── */
+
+.bt-track {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 24px 16px;
+  background: linear-gradient(135deg, #f0f4ff 0%, #f8f0ff 100%);
+  border-radius: 12px;
+  border: 1px solid #d0d8f0;
+  position: relative;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+.bt-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 72px;
+  flex-shrink: 0;
+}
+
+.bt-icon {
+  font-size: 32px;
+  line-height: 1;
+  margin-bottom: 4px;
+}
+
+.bt-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: #2c3e50;
+}
+
+.bt-ip {
+  font-size: 11px;
+  color: #7f8c8d;
+  font-family: 'Courier New', monospace;
+  margin-top: 2px;
+  text-align: center;
+}
+
+.bt-status--connected {
+  font-size: 11px;
+  color: #27ae60;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.bt-status--waiting {
+  font-size: 11px;
+  color: #95a5a6;
+  margin-top: 2px;
+}
+
+.bt-lane {
+  flex: 1;
+  position: relative;
+  height: 60px;
+  display: flex;
+  align-items: center;
+}
+
+.bt-wire {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: repeating-linear-gradient(
+    90deg,
+    #a0b4e0 0px,
+    #a0b4e0 8px,
+    transparent 8px,
+    transparent 18px
+  );
+}
+
+@keyframes bt-fly {
+  0%   { left: 0;                  opacity: 0; transform: scale(0.6) translateY(-50%); }
+  8%   {                           opacity: 1; transform: scale(1)   translateY(-50%); }
+  92%  {                           opacity: 1; transform: scale(1)   translateY(-50%); }
+  100% { left: calc(100% - 80px); opacity: 0; transform: scale(0.6) translateY(-50%); }
+}
+
+.bt-ball {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 80px;
+  height: 46px;
+  border-radius: 23px;
+  background: linear-gradient(135deg, #3498db, #9b59b6);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  font-family: 'Courier New', monospace;
+  line-height: 1.3;
+  text-align: center;
+  box-shadow: 0 4px 14px rgba(52, 152, 219, 0.45);
+  animation: bt-fly 2.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+  z-index: 1;
+  padding: 0 6px;
+}
+
+.bt-hint {
+  color: #95a5a6;
+  font-style: italic;
+}

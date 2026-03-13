@@ -20,12 +20,14 @@ pub fn run() {
             device_linking::add_linked_device,
             device_linking::start_pairing_server,
             device_linking::stop_pairing_server,
+            device_linking::get_local_ips,
             // CV processing commands
             cv_processor::validate_recycling_image,
             // Storage commands
             storage::load_progress,
             storage::save_progress,
             storage::award_points,
+            storage::unlock_module,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

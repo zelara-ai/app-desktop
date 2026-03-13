@@ -23,11 +23,17 @@ const TestingPanel: React.FC = () => {
   const [lastResult, setLastResult] = useState<InversionResult | null>(null);
   const [currentTime, setCurrentTime] = useState(new Date().toLocaleTimeString());
   const [counter, setCounter] = useState<number | null>(null);
+  const [localIps, setLocalIps] = useState<string[]>([]);
 
   useEffect(() => {
     // Load current device count from backend
     invoke<DeviceInfo[]>('get_linked_devices')
       .then((devices) => setConnectedDevices(devices.length))
+      .catch(() => {});
+
+    // Load local IPs for BLE discovery display
+    invoke<string[]>('get_local_ips')
+      .then(setLocalIps)
       .catch(() => {});
 
     // Clock — updates every second
@@ -65,6 +71,9 @@ const TestingPanel: React.FC = () => {
     setTestLog(prev => [`[${timestamp}] ${message}`, ...prev].slice(0, 50));
   };
 
+  const primaryIp = localIps[0] ?? '—';
+  const isConnected = connectedDevices > 0;
+
   return (
     <div className="testing-panel">
       <div className="testing-header">
@@ -93,15 +102,62 @@ const TestingPanel: React.FC = () => {
         <div className="status-row">
           <div className={`status-indicator ${serverRunning ? 'running' : 'stopped'}`} />
           <span className="status-text">
-            {serverRunning ? 'Running on port 8765' : 'Stopped'}
+            {serverRunning ? 'WSS running on port 8765' : 'Stopped'}
           </span>
         </div>
         <div className="status-row">
-          <div className={`status-indicator ${connectedDevices > 0 ? 'connected' : 'disconnected'}`} />
+          <div className={`status-indicator ${isConnected ? 'connected' : 'disconnected'}`} />
           <span className="status-text">
             {connectedDevices} connected device(s)
           </span>
         </div>
+      </div>
+
+      {/* ── Bluetooth Discovery Test ── */}
+      <div className="testing-section">
+        <h3>Bluetooth Discovery Test</h3>
+        <p className="section-description">
+          Simulates what BLE will broadcast in Phase 3 — Desktop advertises its IP so
+          Mobile can auto-connect without scanning the QR code. The animation shows the
+          IP packet flying over the Bluetooth channel.
+        </p>
+
+        <div className="bt-track">
+          <div className="bt-node">
+            <span className="bt-icon">💻</span>
+            <span className="bt-label">Desktop</span>
+            <span className="bt-ip">{primaryIp}</span>
+          </div>
+
+          <div className="bt-lane">
+            <div className="bt-wire" />
+            {isConnected && (
+              <div className="bt-ball">
+                <span>{primaryIp}</span>
+                <span>:8765</span>
+              </div>
+            )}
+          </div>
+
+          <div className="bt-node">
+            <span className="bt-icon">📱</span>
+            <span className="bt-label">Mobile</span>
+            <span className={isConnected ? 'bt-status--connected' : 'bt-status--waiting'}>
+              {isConnected ? 'Connected' : 'Waiting…'}
+            </span>
+          </div>
+        </div>
+
+        {!isConnected && (
+          <p className="section-description bt-hint">
+            Connect a mobile device via the Device Pairing screen to see the animation.
+          </p>
+        )}
+        {localIps.length > 1 && (
+          <p className="section-description">
+            All interfaces BLE would advertise: <code>{localIps.join(', ')}</code>
+          </p>
+        )}
       </div>
 
       <div className="testing-section">

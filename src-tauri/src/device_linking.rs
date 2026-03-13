@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
 use tokio::net::TcpListener;
@@ -9,6 +10,10 @@ use local_ip_address::local_ip;
 use qrcode::QrCode;
 use image::Luma;
 use base64::{engine::general_purpose, Engine as _};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio_rustls::TlsAcceptor;
+use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceInfo {
@@ -85,6 +90,61 @@ fn get_all_local_ips() -> Vec<String> {
             .collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Returns a TLS acceptor backed by a self-signed certificate.
+/// The cert is generated once on first launch and persisted to the app data dir.
+fn create_tls_acceptor() -> Result<TlsAcceptor, String> {
+    let cert_dir = dirs::data_local_dir()
+        .ok_or("Could not locate app data directory")?
+        .join("Zelara");
+
+    std::fs::create_dir_all(&cert_dir)
+        .map_err(|e| format!("Failed to create cert dir: {}", e))?;
+
+    let cert_path = cert_dir.join("zelara_cert.pem");
+    let key_path  = cert_dir.join("zelara_key.pem");
+
+    // Generate cert on first run; reuse on subsequent runs
+    let (cert_pem, key_pem) = if cert_path.exists() && key_path.exists() {
+        let c = std::fs::read_to_string(&cert_path)
+            .map_err(|e| format!("Failed to read cert: {}", e))?;
+        let k = std::fs::read_to_string(&key_path)
+            .map_err(|e| format!("Failed to read key: {}", e))?;
+        (c, k)
+    } else {
+        let subject_alt_names = vec!["zelara.local".to_string(), "localhost".to_string()];
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(subject_alt_names)
+                .map_err(|e| format!("Cert generation failed: {}", e))?;
+        let c = cert.pem();
+        let k = key_pair.serialize_pem();
+        std::fs::write(&cert_path, &c)
+            .map_err(|e| format!("Failed to write cert: {}", e))?;
+        std::fs::write(&key_path, &k)
+            .map_err(|e| format!("Failed to write key: {}", e))?;
+        println!("Generated new self-signed TLS certificate at {:?}", cert_dir);
+        (c, k)
+    };
+
+    // Parse PEM cert chain
+    let cert_chain: Vec<CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to parse TLS cert: {}", e))?;
+
+    // Parse PEM private key
+    let private_key: PrivateKeyDer<'static> =
+        rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
+            .map_err(|e| format!("Failed to parse TLS key: {}", e))?
+            .ok_or_else(|| "No private key found in PEM".to_string())?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .map_err(|e| format!("TLS config error: {}", e))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 #[tauri::command]
@@ -190,6 +250,9 @@ pub async fn start_pairing_server(
         }
     }
 
+    // Build TLS acceptor (generates cert on first run)
+    let tls_acceptor = create_tls_acceptor()?;
+
     // Bind to all interfaces so connections work on any network (WiFi, hotspot, etc.)
     let addr = "0.0.0.0:8765".to_string();
 
@@ -200,7 +263,7 @@ pub async fn start_pairing_server(
 
     // Spawn server task
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&addr, server_running, pairing_token, linked_devices, app_handle).await {
+        if let Err(e) = run_websocket_server(&addr, tls_acceptor, server_running, pairing_token, linked_devices, app_handle).await {
             eprintln!("WebSocket server error: {}", e);
         }
     });
@@ -210,6 +273,7 @@ pub async fn start_pairing_server(
 
 async fn run_websocket_server(
     addr: &str,
+    tls_acceptor: TlsAcceptor,
     server_running: Arc<Mutex<bool>>,
     pairing_token: Arc<Mutex<Option<String>>>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
@@ -219,7 +283,7 @@ async fn run_websocket_server(
         .await
         .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
 
-    println!("WebSocket pairing server listening on {}", addr);
+    println!("WSS pairing server listening on {}", addr);
 
     while *server_running.lock().unwrap() {
         match listener.accept().await {
@@ -231,16 +295,25 @@ async fn run_websocket_server(
                 let devices = linked_devices.clone();
                 let remote_addr = addr.to_string();
                 let handle = app_handle.clone();
+                let acceptor = tls_acceptor.clone();
 
                 tokio::spawn(async move {
-                    match accept_async(stream).await {
-                        Ok(ws_stream) => {
-                            if let Err(e) = handle_websocket_connection(ws_stream, token, devices, remote_addr, handle).await {
-                                eprintln!("WebSocket connection error: {}", e);
+                    // Wrap TCP stream with TLS
+                    match acceptor.accept(stream).await {
+                        Ok(tls_stream) => {
+                            match accept_async(tls_stream).await {
+                                Ok(ws_stream) => {
+                                    if let Err(e) = handle_websocket_connection(ws_stream, token, devices, remote_addr, handle).await {
+                                        eprintln!("WebSocket connection error: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("WebSocket handshake error: {}", e);
+                                }
                             }
                         }
                         Err(e) => {
-                            eprintln!("WebSocket handshake error: {}", e);
+                            eprintln!("TLS handshake error: {}", e);
                         }
                     }
                 });
@@ -254,13 +327,16 @@ async fn run_websocket_server(
     Ok(())
 }
 
-async fn handle_websocket_connection(
-    ws_stream: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+async fn handle_websocket_connection<S>(
+    ws_stream: tokio_tungstenite::WebSocketStream<S>,
     expected_token: Option<String>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     remote_addr: String,
     app_handle: tauri::AppHandle,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut write, mut read) = ws_stream.split();
     let mut device_registered = false;
 
@@ -321,6 +397,12 @@ async fn handle_websocket_connection(
                             match crate::cv_processor::validate_image(image_data) {
                                 Ok(result) => {
                                     println!("CV validation: success={}, confidence={}", result.success, result.confidence);
+                                    // Award points on Desktop for successful validation and notify UI
+                                    if result.success {
+                                        if let Ok(updated) = crate::storage::award_points(10) {
+                                            let _ = app_handle.emit("progress-updated", &updated);
+                                        }
+                                    }
                                     TaskResponse {
                                         task_id: request.task_id,
                                         success: result.success,
@@ -485,4 +567,12 @@ fn invert_image(base64_image: &str) -> Result<String, String> {
 pub fn stop_pairing_server(state: State<DeviceLinkingState>) -> Result<(), String> {
     *state.server_running.lock().unwrap() = false;
     Ok(())
+}
+
+/// Returns all non-loopback IPv4 addresses on this machine.
+/// Used by the BLE Discovery Test in the Testing Module to show what
+/// the Bluetooth advertisement will broadcast when Phase 3 is implemented.
+#[tauri::command]
+pub fn get_local_ips() -> Vec<String> {
+    get_all_local_ips()
 }
