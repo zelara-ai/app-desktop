@@ -1,0 +1,5 @@
+# Cargo configuration for zelara-desktop
+# Build requirements for ARM64 Windows:
+#   - cmake (aws-lc-sys C compilation)
+#   - NASM (aws-lc-sys ARM64 assembly)
+#   - clang/LLVM (ring ARM64 assembly)
