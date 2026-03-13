@@ -18,17 +18,19 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    const unlisteners: Array<() => void> = [];
 
     listen<{ id: string; name: string; platform: string }>('device-linked', (event) => {
       setToastMessage(`Device linked: ${event.payload.name}`);
       setTimeout(() => setToastMessage(null), 3000);
-    }).then((fn) => {
-      unlisten = fn;
-    });
+    }).then((fn) => unlisteners.push(fn));
+
+    listen<UserProgress>('progress-updated', (event) => {
+      setProgress(event.payload);
+    }).then((fn) => unlisteners.push(fn));
 
     return () => {
-      unlisten?.();
+      unlisteners.forEach((fn) => fn());
     };
   }, []);
 

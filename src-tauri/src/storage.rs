@@ -74,3 +74,19 @@ pub fn award_points(points_to_add: i32) -> Result<UserProgress, String> {
     save_progress(progress.clone())?;
     Ok(progress)
 }
+
+#[tauri::command]
+pub fn unlock_module(module_name: String) -> Result<UserProgress, String> {
+    let mut progress = load_progress()?;
+
+    // Move from available_unlocks to unlocked_modules
+    progress.available_unlocks.retain(|m| m != &module_name);
+
+    if !progress.unlocked_modules.contains(&module_name) {
+        progress.unlocked_modules.push(module_name);
+    }
+
+    progress.last_updated = chrono::Utc::now().to_rfc3339();
+    save_progress(progress.clone())?;
+    Ok(progress)
+}
