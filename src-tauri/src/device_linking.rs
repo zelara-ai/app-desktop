@@ -370,6 +370,8 @@ where
 {
     let (mut write, mut read) = ws_stream.split();
     let mut device_registered = false;
+    // Stable device ID sent by mobile in the handshake; used for cleanup on disconnect.
+    let mut registered_device_id: Option<String> = None;
 
     while let Some(message) = read.next().await {
         match message {
@@ -399,20 +401,33 @@ where
 
                     // Register device after successful token verification
                     if !device_registered {
+                        // Use stable device_id sent by mobile in the handshake payload.
+                        // Falls back to a timestamp-based ID for backward compatibility.
+                        let stable_id = request.payload
+                            .get("device_id")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("mobile_{}", chrono::Utc::now().timestamp()));
+
                         let device = DeviceInfo {
-                            id: format!("mobile_{}", chrono::Utc::now().timestamp()),
+                            id: stable_id.clone(),
                             name: format!("Mobile ({})", remote_addr),
                             platform: "mobile".to_string(),
                         };
 
                         let mut devices = linked_devices.lock().unwrap();
-                        // Don't add duplicate devices
-                        if !devices.iter().any(|d| d.name == device.name) {
+                        // Deduplicate by stable device ID, not by name+port.
+                        // If same device reconnects (e.g. after network drop), replace the old entry.
+                        if let Some(existing) = devices.iter_mut().find(|d| d.id == device.id) {
+                            existing.name = device.name.clone();
+                            println!("Re-registered known device: {} ({})", stable_id, remote_addr);
+                        } else {
                             devices.push(device.clone());
-                            println!("Registered mobile device: {}", remote_addr);
-                            // Push update to the frontend immediately
+                            println!("Registered mobile device: {} ({})", stable_id, remote_addr);
+                            // Push update to the frontend only for genuinely new devices
                             let _ = app_handle.emit("device-linked", &device);
                         }
+                        registered_device_id = Some(stable_id);
                         device_registered = true;
                     }
                 }
@@ -551,17 +566,27 @@ where
                     .map_err(|e| format!("Failed to send response: {}", e))?;
             }
             Ok(Message::Close(_)) => {
-                println!("WebSocket connection closed");
+                println!("WebSocket connection closed: {}", remote_addr);
                 break;
             }
             Ok(_) => {
                 // Ignore other message types (Binary, Ping, Pong)
             }
             Err(e) => {
-                eprintln!("WebSocket read error: {}", e);
+                eprintln!("WebSocket read error from {}: {}", remote_addr, e);
                 break;
             }
         }
+    }
+
+    // Remove device from the linked list and notify the frontend regardless of
+    // whether the connection ended cleanly (Close frame) or due to an error.
+    if let Some(id) = registered_device_id {
+        let mut devices = linked_devices.lock().unwrap();
+        devices.retain(|d| d.id != id);
+        drop(devices);
+        println!("Device disconnected and removed: {}", id);
+        let _ = app_handle.emit("device-disconnected", serde_json::json!({ "id": id }));
     }
 
     Ok(())

@@ -49,6 +49,12 @@ const TestingPanel: React.FC = () => {
       addLogEntry(`Device linked: ${event.payload.name}`);
     }).then((fn) => unlisteners.push(fn));
 
+    // Update device count when a device disconnects
+    listen<{ id: string }>('device-disconnected', (event) => {
+      setConnectedDevices((prev) => Math.max(0, prev - 1));
+      addLogEntry(`Device disconnected: ${event.payload.id}`);
+    }).then((fn) => unlisteners.push(fn));
+
     // Display image inversion results sent from mobile
     listen<InversionResult>('image-inversion-result', (event) => {
       setLastResult(event.payload);
@@ -113,13 +119,13 @@ const TestingPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* ── Bluetooth Discovery Test ── */}
+      {/* ── BLE Discovery Preview (Phase 3 simulation — no actual Bluetooth used) ── */}
       <div className="testing-section">
-        <h3>Bluetooth Discovery Test</h3>
+        <h3>BLE Discovery — Phase 3 Preview</h3>
         <p className="section-description">
-          Simulates what BLE will broadcast in Phase 3 — Desktop advertises its IP so
-          Mobile can auto-connect without scanning the QR code. The animation shows the
-          IP packet flying over the Bluetooth channel.
+          Visual simulation only — no Bluetooth is active. Previews what Phase 3 will do:
+          Desktop will advertise its IP over BLE so Mobile can auto-connect without scanning
+          a QR code. Currently, QR pairing is required (Phase 1).
         </p>
 
         <div className="bt-track">
