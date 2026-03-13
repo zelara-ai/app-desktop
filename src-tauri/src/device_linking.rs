@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
@@ -147,6 +148,19 @@ fn create_tls_acceptor() -> Result<TlsAcceptor, String> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// Compute the SHA-256 fingerprint of a PEM-encoded certificate.
+/// Returns a base64-encoded string suitable for certificate pinning on mobile.
+fn cert_fingerprint_base64(cert_pem: &str) -> Result<String, String> {
+    let der: CertificateDer = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
+        .next()
+        .ok_or("No certificate found in PEM")?
+        .map_err(|e| format!("Failed to parse cert PEM: {}", e))?;
+    let hash = Sha256::digest(der.as_ref());
+    let fp = general_purpose::STANDARD.encode(hash);
+    println!("[ZelaraTLS] cert_fingerprint_base64: {} (len={})", fp, fp.len());
+    Ok(fp)
+}
+
 #[tauri::command]
 pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo, String> {
     // Generate pairing token
@@ -163,9 +177,26 @@ pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo,
 
     let port = 8765;
 
+    // Read cert fingerprint for mobile certificate pinning
+    let cert_path = dirs::data_local_dir()
+        .ok_or("Could not locate app data directory")?
+        .join("Zelara")
+        .join("zelara_cert.pem");
+    let cert_fp = if cert_path.exists() {
+        let pem = std::fs::read_to_string(&cert_path)
+            .map_err(|e| format!("Failed to read cert: {}", e))?;
+        cert_fingerprint_base64(&pem)?
+    } else {
+        return Err("TLS certificate not found — start the pairing server first".to_string());
+    };
+
     // Encode all IPs comma-separated so mobile can try each one
     let ips_encoded = ip_addresses.join(",");
-    let qr_data = format!("zelara://pair?ips={}&port={}&token={}", ips_encoded, port, token);
+    println!("[ZelaraTLS] QR cert param: {} (len={})", cert_fp, cert_fp.len());
+    let qr_data = format!(
+        "zelara://pair?ips={}&port={}&token={}&cert={}",
+        ips_encoded, port, token, cert_fp
+    );
 
     // Generate QR code image
     let code = QrCode::new(qr_data.as_bytes())
