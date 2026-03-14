@@ -15,6 +15,12 @@ function App() {
 
   useEffect(() => {
     loadProgress();
+    // Start the WSS/TLS pairing server at launch so BLE auto-discovery
+    // connections succeed immediately (BLE advertises this address from startup).
+    // The command is idempotent — safe to call again when QR code is generated.
+    invoke('start_pairing_server').catch((e: any) =>
+      console.error('[App] Failed to auto-start pairing server:', e),
+    );
   }, []);
 
   useEffect(() => {

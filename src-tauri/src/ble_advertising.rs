@@ -10,17 +10,16 @@
 ///   Bytes 0–3  : IPv4 address (big-endian octets)
 ///   Bytes 4–5  : Port number  (big-endian u16)
 ///
-/// A fixed Zelara service UUID is also included in the advertisement so
-/// Mobile can filter scans efficiently (required on iOS).
-///
-/// ZELARA_SERVICE_UUID = "a1b2c3d4-e5f6-7a8b-9c0d-e1f2a3b4c5d6"
+/// The service UUID (a1b2c3d4-e5f6-7a8b-9c0d-e1f2a3b4c5d6) is intentionally
+/// NOT included in the advertisement. A 128-bit UUID AD structure (18 bytes)
+/// plus manufacturer data (10 bytes) plus the auto-added Flags (3 bytes) hits
+/// exactly the 31-byte BLE legacy advertisement limit, causing Start() to fail
+/// with E_INVALIDARG on Windows. The company ID (0xFFFE) is sufficient for
+/// filtering. If iOS support is needed in future, consider a scan-response
+/// packet or BLE 5 extended advertising.
 
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
-
-/// Well-known Zelara BLE service UUID used for advertisement filtering.
-/// Mobile scans for this UUID; Desktop includes it in every advertisement.
-pub const ZELARA_SERVICE_UUID: &str = "a1b2c3d4-e5f6-7a8b-9c0d-e1f2a3b4c5d6";
 
 /// Manufacturer-specific data company ID (0xFFFE = Bluetooth SIG test/reserved).
 pub const ZELARA_COMPANY_ID: u16 = 0xFFFE;
@@ -51,20 +50,11 @@ mod platform {
     use super::{BleStatus, ZELARA_COMPANY_ID};
     use std::sync::Mutex;
     use windows::{
-        core::GUID,
         Devices::Bluetooth::Advertisement::{
             BluetoothLEAdvertisementPublisher, BluetoothLEManufacturerData,
         },
         Storage::Streams::DataWriter,
     };
-
-    // a1b2c3d4-e5f6-7a8b-9c0d-e1f2a3b4c5d6
-    const ZELARA_GUID: GUID = GUID::from_values(
-        0xa1b2c3d4,
-        0xe5f6,
-        0x7a8b,
-        [0x9c, 0x0d, 0xe1, 0xf2, 0xa3, 0xb4, 0xc5, 0xd6],
-    );
 
     /// Opaque wrapper that keeps the WinRT publisher alive until dropped.
     /// We implement Send + Sync manually because WinRT objects use COM agile
@@ -105,13 +95,6 @@ mod platform {
                 .Advertisement()
                 .map_err(|e| format!("Failed to access advertisement from publisher: {e}"))?;
 
-            // ── Service UUID — enables filtered scanning on iOS and Android ──
-            advertisement
-                .ServiceUuids()
-                .map_err(|e| format!("Cannot access ServiceUuids: {e}"))?
-                .Append(ZELARA_GUID)
-                .map_err(|e| format!("Failed to append Zelara service UUID: {e}"))?;
-
             // ── Manufacturer data — encodes IP:port for the mobile scanner ──
             // Parse IPv4 address into 4 bytes
             let octets: Vec<u8> = ip
@@ -144,13 +127,13 @@ mod platform {
                 .map_err(|e| format!("Failed to create manufacturer data: {e}"))?;
             mfr.SetCompanyId(ZELARA_COMPANY_ID)
                 .map_err(|e| format!("Failed to set company ID: {e}"))?;
-            mfr.SetData(buffer)
+            mfr.SetData(&buffer)
                 .map_err(|e| format!("Failed to set manufacturer data payload: {e}"))?;
 
             advertisement
                 .ManufacturerData()
                 .map_err(|e| format!("Cannot access ManufacturerData: {e}"))?
-                .Append(mfr)
+                .Append(&mfr)
                 .map_err(|e| format!("Failed to append manufacturer data: {e}"))?;
 
             // Start broadcasting
