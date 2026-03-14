@@ -7,7 +7,14 @@ interface DeviceInfo {
   id: string;
   name: string;
   platform: string;
+  discovery_method?: string; // "ble" | "qr"
 }
+
+type BleStatus =
+  | { status: 'notSupported' }
+  | { status: 'idle' }
+  | { status: 'advertising'; ip: string; port: number }
+  | { status: 'error'; message: string };
 
 interface InversionResult {
   original: string;
@@ -24,6 +31,8 @@ const TestingPanel: React.FC = () => {
   const [currentTime, setCurrentTime] = useState(new Date().toLocaleTimeString());
   const [counter, setCounter] = useState<number | null>(null);
   const [localIps, setLocalIps] = useState<string[]>([]);
+  const [bleConnectedDevices, setBleConnectedDevices] = useState(0);
+  const [bleStatus, setBleStatus] = useState<BleStatus>({ status: 'idle' });
 
   useEffect(() => {
     // Load current device count from backend
@@ -36,6 +45,11 @@ const TestingPanel: React.FC = () => {
       .then(setLocalIps)
       .catch(() => {});
 
+    // Load current BLE advertising status
+    invoke<BleStatus>('get_ble_status')
+      .then(setBleStatus)
+      .catch(() => {});
+
     // Clock — updates every second
     const clockInterval = setInterval(() => {
       setCurrentTime(new Date().toLocaleTimeString());
@@ -46,12 +60,19 @@ const TestingPanel: React.FC = () => {
     // Update device count when a new device links
     listen<DeviceInfo>('device-linked', (event) => {
       setConnectedDevices((prev) => prev + 1);
-      addLogEntry(`Device linked: ${event.payload.name}`);
+      if (event.payload.discovery_method === 'ble') {
+        setBleConnectedDevices((prev) => prev + 1);
+      }
+      const method = event.payload.discovery_method === 'ble' ? ' (BLE)' : ' (QR)';
+      addLogEntry(`Device linked: ${event.payload.name}${method}`);
     }).then((fn) => unlisteners.push(fn));
 
     // Update device count when a device disconnects
-    listen<{ id: string }>('device-disconnected', (event) => {
+    listen<{ id: string; discovery_method?: string }>('device-disconnected', (event) => {
       setConnectedDevices((prev) => Math.max(0, prev - 1));
+      if (event.payload.discovery_method === 'ble') {
+        setBleConnectedDevices((prev) => Math.max(0, prev - 1));
+      }
       addLogEntry(`Device disconnected: ${event.payload.id}`);
     }).then((fn) => unlisteners.push(fn));
 
@@ -64,6 +85,17 @@ const TestingPanel: React.FC = () => {
     // Counter sent from mobile every second
     listen<{ value: number }>('counter-update', (event) => {
       setCounter(event.payload.value);
+    }).then((fn) => unlisteners.push(fn));
+
+    // BLE advertising status changes (e.g., started, stopped, error)
+    listen<BleStatus>('ble-status-changed', (event) => {
+      setBleStatus(event.payload);
+      const label =
+        event.payload.status === 'advertising' ? 'BLE advertising active' :
+        event.payload.status === 'idle' ? 'BLE advertising stopped' :
+        event.payload.status === 'error' ? `BLE error: ${(event.payload as any).message}` :
+        'BLE not supported';
+      addLogEntry(label);
     }).then((fn) => unlisteners.push(fn));
 
     return () => {
@@ -79,6 +111,7 @@ const TestingPanel: React.FC = () => {
 
   const primaryIp = localIps[0] ?? '—';
   const isConnected = connectedDevices > 0;
+  const bleConnected = bleConnectedDevices > 0;
 
   return (
     <div className="testing-panel">
@@ -119,13 +152,29 @@ const TestingPanel: React.FC = () => {
         </div>
       </div>
 
-      {/* ── BLE Discovery Preview (Phase 3 simulation — no actual Bluetooth used) ── */}
+      {/* ── BLE Auto-Discovery ── */}
       <div className="testing-section">
-        <h3>BLE Discovery — Phase 3 Preview</h3>
+        <h3>BLE Auto-Discovery</h3>
+        <div className="status-row">
+          <div className={`status-indicator ${
+            bleStatus.status === 'advertising' ? 'running' :
+            bleStatus.status === 'notSupported' ? 'stopped' :
+            bleStatus.status === 'error' ? 'stopped' :
+            'disconnected'
+          }`} />
+          <span className="status-text">
+            {bleStatus.status === 'advertising'
+              ? `Advertising on ${(bleStatus as any).ip}:${(bleStatus as any).port}`
+              : bleStatus.status === 'notSupported'
+              ? 'BLE not available on this machine'
+              : bleStatus.status === 'error'
+              ? `BLE error: ${(bleStatus as any).message}`
+              : 'BLE advertising idle'}
+          </span>
+        </div>
         <p className="section-description">
-          Visual simulation only — no Bluetooth is active. Previews what Phase 3 will do:
-          Desktop will advertise its IP over BLE so Mobile can auto-connect without scanning
-          a QR code. Currently, QR pairing is required (Phase 1).
+          Desktop advertises its IP over Bluetooth so Mobile can connect without scanning a QR code.
+          The animation shows live BLE-linked devices. QR pairing is always available as a fallback.
         </p>
 
         <div className="bt-track">
@@ -137,7 +186,7 @@ const TestingPanel: React.FC = () => {
 
           <div className="bt-lane">
             <div className="bt-wire" />
-            {isConnected && (
+            {bleConnected && (
               <div className="bt-ball">
                 <span>{primaryIp}</span>
                 <span>:8765</span>
@@ -148,20 +197,20 @@ const TestingPanel: React.FC = () => {
           <div className="bt-node">
             <span className="bt-icon">📱</span>
             <span className="bt-label">Mobile</span>
-            <span className={isConnected ? 'bt-status--connected' : 'bt-status--waiting'}>
-              {isConnected ? 'Connected' : 'Waiting…'}
+            <span className={bleConnected ? 'bt-status--connected' : 'bt-status--waiting'}>
+              {bleConnected ? 'Connected via BLE' : 'Waiting…'}
             </span>
           </div>
         </div>
 
-        {!isConnected && (
+        {!bleConnected && (
           <p className="section-description bt-hint">
-            Connect a mobile device via the Device Pairing screen to see the animation.
+            Mobile will auto-connect when Bluetooth is active. Use Device Pairing for QR fallback.
           </p>
         )}
         {localIps.length > 1 && (
           <p className="section-description">
-            All interfaces BLE would advertise: <code>{localIps.join(', ')}</code>
+            All interfaces being advertised: <code>{localIps.join(', ')}</code>
           </p>
         )}
       </div>

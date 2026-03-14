@@ -42,3 +42,10 @@ dirs = "5.0"
 local-ip-address = "0.6"
 if-addrs = "0.13"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Devices_Bluetooth_Advertisement",
+    "Foundation_Collections",
+    "Storage_Streams",
+] }
+

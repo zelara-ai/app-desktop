@@ -21,6 +21,7 @@ pub struct DeviceInfo {
     pub id: String,
     pub name: String,
     pub platform: String,
+    pub discovery_method: String, // "ble" | "qr"
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,6 +70,11 @@ impl DeviceLinkingState {
 
 /// Get primary local IP address
 fn get_local_ip() -> Result<String, String> {
+    get_primary_ip_pub()
+}
+
+/// Public helper — used by ble_advertising to get the primary IP for broadcasting.
+pub fn get_primary_ip_pub() -> Result<String, String> {
     local_ip()
         .map(|ip| ip.to_string())
         .map_err(|e| format!("Failed to get local IP: {}", e))
@@ -372,6 +378,9 @@ where
     let mut device_registered = false;
     // Stable device ID sent by mobile in the handshake; used for cleanup on disconnect.
     let mut registered_device_id: Option<String> = None;
+    // Set on the first authenticated message; once true, token checks are skipped for the
+    // lifetime of this connection (BLE proximity is the trust anchor for the whole session).
+    let mut is_ble_connection = false;
 
     while let Some(message) = read.next().await {
         match message {
@@ -382,54 +391,74 @@ where
 
                 println!("Received task: {} ({})", request.task_id, request.task_type);
 
-                // Verify token (first request should include token)
-                if let Some(token) = request.payload.get("token").and_then(|t| t.as_str()) {
-                    if Some(token.to_string()) != expected_token {
-                        let error_response = TaskResponse {
-                            task_id: request.task_id,
-                            success: false,
-                            result: serde_json::json!({ "error": "Invalid pairing token" }),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        };
+                // Determine discovery method from this message (only present on handshake)
+                let msg_discovery_method = request.payload
+                    .get("discovery_method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("qr");
 
-                        let response_text = serde_json::to_string(&error_response)
-                            .map_err(|e| format!("Failed to serialize response: {}", e))?;
-                        write.send(Message::Text(response_text)).await
-                            .map_err(|e| format!("Failed to send response: {}", e))?;
-                        return Err("Invalid token".to_string());
+                // Mark connection as BLE once we see a BLE handshake; sticky for the session.
+                if msg_discovery_method == "ble" {
+                    is_ble_connection = true;
+                }
+
+                // Verify token for QR connections; BLE connections are accepted by proximity.
+                // is_ble_connection stays true for all subsequent messages in the session.
+                let token_ok = if is_ble_connection {
+                    true
+                } else if let Some(token) = request.payload.get("token").and_then(|t| t.as_str()) {
+                    Some(token.to_string()) == expected_token
+                } else {
+                    false
+                };
+
+                if !token_ok {
+                    let error_response = TaskResponse {
+                        task_id: request.task_id,
+                        success: false,
+                        result: serde_json::json!({ "error": "Invalid pairing token" }),
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                    };
+                    let response_text = serde_json::to_string(&error_response)
+                        .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                    write.send(Message::Text(response_text)).await
+                        .map_err(|e| format!("Failed to send response: {}", e))?;
+                    return Err("Invalid token".to_string());
+                }
+
+                // Register device on first authenticated message
+                if !device_registered && token_ok {
+                    // Use stable device_id sent by mobile in the handshake payload.
+                    // Falls back to a timestamp-based ID for backward compatibility.
+                    let stable_id = request.payload
+                        .get("device_id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| format!("mobile_{}", chrono::Utc::now().timestamp()));
+
+                    let method_label = if is_ble_connection { "ble" } else { "qr" };
+                    let device = DeviceInfo {
+                        id: stable_id.clone(),
+                        name: format!("Mobile ({})", remote_addr),
+                        platform: "mobile".to_string(),
+                        discovery_method: method_label.to_string(),
+                    };
+
+                    let mut devices = linked_devices.lock().unwrap();
+                    // Deduplicate by stable device ID, not by name+port.
+                    // If same device reconnects (e.g. after network drop), replace the old entry.
+                    if let Some(existing) = devices.iter_mut().find(|d| d.id == device.id) {
+                        existing.name = device.name.clone();
+                        existing.discovery_method = device.discovery_method.clone();
+                        println!("Re-registered known device: {} ({}) via {}", stable_id, remote_addr, method_label);
+                    } else {
+                        devices.push(device.clone());
+                        println!("Registered mobile device: {} ({}) via {}", stable_id, remote_addr, method_label);
+                        // Push update to the frontend only for genuinely new devices
+                        let _ = app_handle.emit("device-linked", &device);
                     }
-
-                    // Register device after successful token verification
-                    if !device_registered {
-                        // Use stable device_id sent by mobile in the handshake payload.
-                        // Falls back to a timestamp-based ID for backward compatibility.
-                        let stable_id = request.payload
-                            .get("device_id")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string())
-                            .unwrap_or_else(|| format!("mobile_{}", chrono::Utc::now().timestamp()));
-
-                        let device = DeviceInfo {
-                            id: stable_id.clone(),
-                            name: format!("Mobile ({})", remote_addr),
-                            platform: "mobile".to_string(),
-                        };
-
-                        let mut devices = linked_devices.lock().unwrap();
-                        // Deduplicate by stable device ID, not by name+port.
-                        // If same device reconnects (e.g. after network drop), replace the old entry.
-                        if let Some(existing) = devices.iter_mut().find(|d| d.id == device.id) {
-                            existing.name = device.name.clone();
-                            println!("Re-registered known device: {} ({})", stable_id, remote_addr);
-                        } else {
-                            devices.push(device.clone());
-                            println!("Registered mobile device: {} ({})", stable_id, remote_addr);
-                            // Push update to the frontend only for genuinely new devices
-                            let _ = app_handle.emit("device-linked", &device);
-                        }
-                        registered_device_id = Some(stable_id);
-                        device_registered = true;
-                    }
+                    registered_device_id = Some(stable_id);
+                    device_registered = true;
                 }
 
                 // Process task based on type
@@ -583,10 +612,17 @@ where
     // whether the connection ended cleanly (Close frame) or due to an error.
     if let Some(id) = registered_device_id {
         let mut devices = linked_devices.lock().unwrap();
+        let removed_method = devices.iter()
+            .find(|d| d.id == id)
+            .map(|d| d.discovery_method.clone())
+            .unwrap_or_else(|| "qr".to_string());
         devices.retain(|d| d.id != id);
         drop(devices);
         println!("Device disconnected and removed: {}", id);
-        let _ = app_handle.emit("device-disconnected", serde_json::json!({ "id": id }));
+        let _ = app_handle.emit("device-disconnected", serde_json::json!({
+            "id": id,
+            "discovery_method": removed_method
+        }));
     }
 
     Ok(())
@@ -626,8 +662,8 @@ pub fn stop_pairing_server(state: State<DeviceLinkingState>) -> Result<(), Strin
 }
 
 /// Returns all non-loopback IPv4 addresses on this machine.
-/// Used by the BLE Discovery Test in the Testing Module to show what
-/// the Bluetooth advertisement will broadcast when Phase 3 is implemented.
+/// Used by the BLE advertising module to determine which IPs to advertise,
+/// and by the Testing Module to display the current advertisement IPs.
 #[tauri::command]
 pub fn get_local_ips() -> Vec<String> {
     get_all_local_ips()
