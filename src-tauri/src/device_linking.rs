@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
+use std::collections::HashMap;
 use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
@@ -382,228 +383,280 @@ where
     // lifetime of this connection (BLE proximity is the trust anchor for the whole session).
     let mut is_ble_connection = false;
 
-    while let Some(message) = read.next().await {
-        match message {
-            Ok(Message::Text(text)) => {
-                // Parse request
-                let request: TaskRequest = serde_json::from_str(&text)
-                    .map_err(|e| format!("Failed to parse request: {}", e))?;
+    // Channel for the spawned inversion task to return its result to the write loop.
+    let (inversion_tx, mut inversion_rx) = tokio::sync::mpsc::channel::<InversionOutcome>(1);
+    // State for a binary image upload currently being assembled from chunks.
+    let mut inbound_transfer: Option<InboundImageTransfer> = None;
 
-                println!("Received task: {} ({})", request.task_id, request.task_type);
-
-                // Determine discovery method from this message (only present on handshake)
-                let msg_discovery_method = request.payload
-                    .get("discovery_method")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("qr");
-
-                // Mark connection as BLE once we see a BLE handshake; sticky for the session.
-                if msg_discovery_method == "ble" {
-                    is_ble_connection = true;
-                }
-
-                // Verify token for QR connections; BLE connections are accepted by proximity.
-                // is_ble_connection stays true for all subsequent messages in the session.
-                let token_ok = if is_ble_connection {
-                    true
-                } else if let Some(token) = request.payload.get("token").and_then(|t| t.as_str()) {
-                    Some(token.to_string()) == expected_token
-                } else {
-                    false
-                };
-
-                if !token_ok {
-                    let error_response = TaskResponse {
-                        task_id: request.task_id,
-                        success: false,
-                        result: serde_json::json!({ "error": "Invalid pairing token" }),
-                        timestamp: chrono::Utc::now().to_rfc3339(),
-                    };
-                    let response_text = serde_json::to_string(&error_response)
-                        .map_err(|e| format!("Failed to serialize response: {}", e))?;
-                    write.send(Message::Text(response_text)).await
-                        .map_err(|e| format!("Failed to send response: {}", e))?;
-                    return Err("Invalid token".to_string());
-                }
-
-                // Register device on first authenticated message
-                if !device_registered && token_ok {
-                    // Use stable device_id sent by mobile in the handshake payload.
-                    // Falls back to a timestamp-based ID for backward compatibility.
-                    let stable_id = request.payload
-                        .get("device_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("mobile_{}", chrono::Utc::now().timestamp()));
-
-                    let method_label = if is_ble_connection { "ble" } else { "qr" };
-                    let device = DeviceInfo {
-                        id: stable_id.clone(),
-                        name: format!("Mobile ({})", remote_addr),
-                        platform: "mobile".to_string(),
-                        discovery_method: method_label.to_string(),
-                    };
-
-                    let mut devices = linked_devices.lock().unwrap();
-                    // Deduplicate by stable device ID, not by name+port.
-                    // If same device reconnects (e.g. after network drop), replace the old entry.
-                    if let Some(existing) = devices.iter_mut().find(|d| d.id == device.id) {
-                        existing.name = device.name.clone();
-                        existing.discovery_method = device.discovery_method.clone();
-                        println!("Re-registered known device: {} ({}) via {}", stable_id, remote_addr, method_label);
-                    } else {
-                        devices.push(device.clone());
-                        println!("Registered mobile device: {} ({}) via {}", stable_id, remote_addr, method_label);
-                        // Push update to the frontend only for genuinely new devices
-                        let _ = app_handle.emit("device-linked", &device);
+    'outer: loop {
+        tokio::select! {
+            // ── Arm 1: incoming WebSocket message ──────────────────────────
+            msg = read.next() => {
+                match msg {
+                    None => break 'outer,
+                    Some(Err(e)) => {
+                        eprintln!("WebSocket read error from {}: {}", remote_addr, e);
+                        break 'outer;
                     }
-                    registered_device_id = Some(stable_id);
-                    device_registered = true;
-                }
-
-                // Process task based on type
-                let response = match request.task_type.as_str() {
-                    "image_validation" => {
-                        // Extract image data
-                        if let Some(image_data) = request.payload.get("imageData").and_then(|d| d.as_str()) {
-                            println!("Received image data: {} bytes", image_data.len());
-
-                            // Call CV processor for actual validation
-                            match crate::cv_processor::validate_image(image_data) {
-                                Ok(result) => {
-                                    println!("CV validation: success={}, confidence={}", result.success, result.confidence);
-                                    // Award points on Desktop for successful validation and notify UI
-                                    if result.success {
-                                        if let Ok(updated) = crate::storage::award_points(10) {
-                                            let _ = app_handle.emit("progress-updated", &updated);
-                                        }
-                                    }
-                                    TaskResponse {
-                                        task_id: request.task_id,
-                                        success: result.success,
-                                        result: serde_json::json!({
-                                            "success": result.success,
-                                            "confidence": result.confidence,
-                                            "message": result.message
-                                        }),
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("CV validation error: {}", e);
-                                    TaskResponse {
-                                        task_id: request.task_id,
-                                        success: false,
-                                        result: serde_json::json!({ "error": format!("Validation failed: {}", e) }),
-                                        timestamp: chrono::Utc::now().to_rfc3339(),
-                                    }
-                                }
+                    Some(Ok(Message::Close(_))) => {
+                        println!("WebSocket connection closed: {}", remote_addr);
+                        break 'outer;
+                    }
+                    Some(Ok(Message::Binary(data))) => {
+                        // Binary chunk: [4 bytes uint32 BE: chunk_index][raw bytes]
+                        if data.len() < 4 {
+                            eprintln!("[BinaryXfer] Frame too short: {} bytes", data.len());
+                            continue 'outer;
+                        }
+                        let chunk_index = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+                        let chunk_data = data[4..].to_vec();
+                        match inbound_transfer {
+                            Some(ref t) if t.is_expired() => {
+                                eprintln!("[BinaryXfer] Transfer '{}' expired (>{}s) — discarding", t.task_id, BINARY_TRANSFER_TIMEOUT_SECS);
+                                inbound_transfer = None;
                             }
-                        } else {
-                            TaskResponse {
-                                task_id: request.task_id,
-                                success: false,
-                                result: serde_json::json!({ "error": "Missing image data" }),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            Some(ref mut transfer) => {
+                                transfer.insert_chunk(chunk_index, chunk_data);
+                                println!("[BinaryXfer] Chunk {} received ({} bytes)", chunk_index, data.len() - 4);
+                            }
+                            None => {
+                                eprintln!("[BinaryXfer] Binary frame received with no active transfer — ignoring");
                             }
                         }
                     }
-                    "image_inversion_test" => {
-                        // Test feature: Invert image colors and send back
-                        if let Some(image_data) = request.payload.get("imageData").and_then(|d| d.as_str()) {
-                            println!("Received image for inversion test: {} bytes", image_data.len());
+                    Some(Ok(Message::Text(text))) => {
+                        // Check for binary transfer control messages before parsing as TaskRequest.
+                        if let Ok(ctrl) = serde_json::from_str::<serde_json::Value>(&text) {
+                            match ctrl.get("type").and_then(|t| t.as_str()) {
+                                Some("img_start") => {
+                                    let task_id = ctrl["taskId"].as_str().unwrap_or("").to_string();
+                                    let total = ctrl["totalChunks"].as_u64().unwrap_or(0) as usize;
+                                    let mime = ctrl["mime"].as_str().unwrap_or("image/jpeg").to_string();
+                                    println!("[BinaryXfer] img_start taskId={} totalChunks={}", task_id, total);
+                                    inbound_transfer = Some(InboundImageTransfer::new(task_id, total, mime));
+                                    continue 'outer;
+                                }
+                                Some("img_end") => {
+                                    let task_id = ctrl["taskId"].as_str().unwrap_or("").to_string();
+                                    println!("[BinaryXfer] img_end taskId={}", task_id);
+                                    if let Some(transfer) = inbound_transfer.take() {
+                                        if transfer.is_expired() {
+                                            eprintln!("[BinaryXfer] img_end: transfer '{}' expired (>{}s) — discarding", task_id, BINARY_TRANSFER_TIMEOUT_SECS);
+                                            continue 'outer;
+                                        }
+                                        if transfer.task_id == task_id && transfer.is_complete() {
+                                            let assembled = transfer.assemble();
+                                            let original = assembled.clone();
+                                            let tid = task_id.clone();
+                                            let tx = inversion_tx.clone();
+                                            let addr = remote_addr.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                match invert_image_bytes(assembled) {
+                                                    Ok(png) => { let _ = tx.blocking_send(InversionOutcome::Success { task_id: tid, png_bytes: png, original_bytes: original, addr }); }
+                                                    Err(e) => { let _ = tx.blocking_send(InversionOutcome::Failure { task_id: tid, error: e }); }
+                                                }
+                                            });
+                                        } else {
+                                            eprintln!("[BinaryXfer] img_end: incomplete or taskId mismatch (got '{}', have '{}')", task_id, transfer.task_id);
+                                        }
+                                    } else {
+                                        eprintln!("[BinaryXfer] img_end with no active transfer");
+                                    }
+                                    continue 'outer;
+                                }
+                                _ => {} // not a control message — fall through to TaskRequest
+                            }
+                        }
 
-                            match invert_image(image_data) {
-                                Ok(inverted_image) => {
-                                    println!("Image inverted successfully");
-                                    // Notify the desktop UI so it can display both images
-                                    let _ = app_handle.emit("image-inversion-result", serde_json::json!({
-                                        "original": image_data,
-                                        "inverted": inverted_image,
-                                        "device": remote_addr,
-                                        "timestamp": chrono::Utc::now().to_rfc3339()
-                                    }));
+                        // Normal TaskRequest handling
+                        let request: TaskRequest = serde_json::from_str(&text)
+                            .map_err(|e| format!("Failed to parse request: {}", e))?;
+
+                        println!("Received task: {} ({})", request.task_id, request.task_type);
+
+                        // Determine discovery method from this message (only present on handshake)
+                        let msg_discovery_method = request.payload
+                            .get("discovery_method")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("qr");
+
+                        // Mark connection as BLE once we see a BLE handshake; sticky for the session.
+                        if msg_discovery_method == "ble" {
+                            is_ble_connection = true;
+                        }
+
+                        // Verify token for QR connections; BLE connections are accepted by proximity.
+                        let token_ok = if is_ble_connection {
+                            true
+                        } else if let Some(token) = request.payload.get("token").and_then(|t| t.as_str()) {
+                            Some(token.to_string()) == expected_token
+                        } else {
+                            false
+                        };
+
+                        if !token_ok {
+                            let error_response = TaskResponse {
+                                task_id: request.task_id,
+                                success: false,
+                                result: serde_json::json!({ "error": "Invalid pairing token" }),
+                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            };
+                            let response_text = serde_json::to_string(&error_response)
+                                .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                            write.send(Message::Text(response_text)).await
+                                .map_err(|e| format!("Failed to send response: {}", e))?;
+                            return Err("Invalid token".to_string());
+                        }
+
+                        // Register device on first authenticated message
+                        if !device_registered && token_ok {
+                            let stable_id = request.payload
+                                .get("device_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| format!("mobile_{}", chrono::Utc::now().timestamp()));
+
+                            let method_label = if is_ble_connection { "ble" } else { "qr" };
+                            let device = DeviceInfo {
+                                id: stable_id.clone(),
+                                name: format!("Mobile ({})", remote_addr),
+                                platform: "mobile".to_string(),
+                                discovery_method: method_label.to_string(),
+                            };
+
+                            let mut devices = linked_devices.lock().unwrap();
+                            // Deduplicate by stable device ID — if same device reconnects, replace the old entry.
+                            if let Some(existing) = devices.iter_mut().find(|d| d.id == device.id) {
+                                existing.name = device.name.clone();
+                                existing.discovery_method = device.discovery_method.clone();
+                                println!("Re-registered known device: {} ({}) via {}", stable_id, remote_addr, method_label);
+                            } else {
+                                devices.push(device.clone());
+                                println!("Registered mobile device: {} ({}) via {}", stable_id, remote_addr, method_label);
+                                let _ = app_handle.emit("device-linked", &device);
+                            }
+                            registered_device_id = Some(stable_id);
+                            device_registered = true;
+                        }
+
+                        // Process task based on type
+                        let response = match request.task_type.as_str() {
+                            "image_validation" => {
+                                if let Some(image_data) = request.payload.get("imageData").and_then(|d| d.as_str()) {
+                                    println!("Received image data: {} bytes", image_data.len());
+                                    match crate::cv_processor::validate_image(image_data) {
+                                        Ok(result) => {
+                                            println!("CV validation: success={}, confidence={}", result.success, result.confidence);
+                                            if result.success {
+                                                if let Ok(updated) = crate::storage::award_points(10) {
+                                                    let _ = app_handle.emit("progress-updated", &updated);
+                                                }
+                                            }
+                                            TaskResponse {
+                                                task_id: request.task_id,
+                                                success: result.success,
+                                                result: serde_json::json!({
+                                                    "success": result.success,
+                                                    "confidence": result.confidence,
+                                                    "message": result.message
+                                                }),
+                                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("CV validation error: {}", e);
+                                            TaskResponse {
+                                                task_id: request.task_id,
+                                                success: false,
+                                                result: serde_json::json!({ "error": format!("Validation failed: {}", e) }),
+                                                timestamp: chrono::Utc::now().to_rfc3339(),
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    TaskResponse {
+                                        task_id: request.task_id,
+                                        success: false,
+                                        result: serde_json::json!({ "error": "Missing image data" }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }
+                                }
+                            }
+                            "counter_update" => {
+                                if let Some(value) = request.payload.get("value").and_then(|v| v.as_i64()) {
+                                    let _ = app_handle.emit("counter-update", serde_json::json!({ "value": value }));
                                     TaskResponse {
                                         task_id: request.task_id,
                                         success: true,
-                                        result: serde_json::json!({
-                                            "invertedImage": inverted_image,
-                                            "message": "Image inverted successfully"
-                                        }),
+                                        result: serde_json::json!({ "received": value }),
                                         timestamp: chrono::Utc::now().to_rfc3339(),
                                     }
-                                }
-                                Err(e) => {
-                                    eprintln!("Image inversion error: {}", e);
+                                } else {
                                     TaskResponse {
                                         task_id: request.task_id,
                                         success: false,
-                                        result: serde_json::json!({ "error": format!("Inversion failed: {}", e) }),
+                                        result: serde_json::json!({ "error": "Missing or invalid counter value" }),
                                         timestamp: chrono::Utc::now().to_rfc3339(),
                                     }
                                 }
                             }
-                        } else {
-                            TaskResponse {
-                                task_id: request.task_id,
-                                success: false,
-                                result: serde_json::json!({ "error": "Missing image data" }),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            "handshake" => {
+                                let client_version = request.payload
+                                    .get("protocolVersion")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                if client_version != PROTOCOL_VERSION as u64 {
+                                    eprintln!(
+                                        "[Protocol] Version mismatch: Desktop={} Mobile={} — binary protocol may behave unexpectedly",
+                                        PROTOCOL_VERSION, client_version
+                                    );
+                                }
+                                TaskResponse {
+                                    task_id: request.task_id,
+                                    success: true,
+                                    result: serde_json::json!({
+                                        "message": "Handshake successful",
+                                        "protocolVersion": PROTOCOL_VERSION
+                                    }),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                }
                             }
-                        }
-                    }
-                    "counter_update" => {
-                        if let Some(value) = request.payload.get("value").and_then(|v| v.as_i64()) {
-                            let _ = app_handle.emit("counter-update", serde_json::json!({ "value": value }));
-                            TaskResponse {
-                                task_id: request.task_id,
-                                success: true,
-                                result: serde_json::json!({ "received": value }),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
+                            _ => {
+                                TaskResponse {
+                                    task_id: request.task_id,
+                                    success: false,
+                                    result: serde_json::json!({ "error": "Unknown task type" }),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
+                                }
                             }
-                        } else {
-                            TaskResponse {
-                                task_id: request.task_id,
-                                success: false,
-                                result: serde_json::json!({ "error": "Missing or invalid counter value" }),
-                                timestamp: chrono::Utc::now().to_rfc3339(),
-                            }
-                        }
-                    }
-                    "handshake" => {
-                        TaskResponse {
-                            task_id: request.task_id,
-                            success: true,
-                            result: serde_json::json!({ "message": "Handshake successful" }),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        }
-                    }
-                    _ => {
-                        TaskResponse {
-                            task_id: request.task_id,
-                            success: false,
-                            result: serde_json::json!({ "error": "Unknown task type" }),
-                            timestamp: chrono::Utc::now().to_rfc3339(),
-                        }
-                    }
-                };
+                        };
 
-                // Send response
-                let response_text = serde_json::to_string(&response)
-                    .map_err(|e| format!("Failed to serialize response: {}", e))?;
-                write.send(Message::Text(response_text)).await
-                    .map_err(|e| format!("Failed to send response: {}", e))?;
+                        // Send response
+                        let response_text = serde_json::to_string(&response)
+                            .map_err(|e| format!("Failed to serialize response: {}", e))?;
+                        write.send(Message::Text(response_text)).await
+                            .map_err(|e| format!("Failed to send response: {}", e))?;
+                    }
+                    Some(Ok(_)) => {} // Ping, Pong — ignore
+                }
             }
-            Ok(Message::Close(_)) => {
-                println!("WebSocket connection closed: {}", remote_addr);
-                break;
-            }
-            Ok(_) => {
-                // Ignore other message types (Binary, Ping, Pong)
-            }
-            Err(e) => {
-                eprintln!("WebSocket read error from {}: {}", remote_addr, e);
-                break;
+
+            // ── Arm 2: inversion task completed on blocking thread pool ────
+            Some(outcome) = inversion_rx.recv() => {
+                match outcome {
+                    InversionOutcome::Success { task_id, png_bytes, original_bytes, addr } => {
+                        send_binary_result(&mut write, &task_id, &png_bytes, &original_bytes, &app_handle, &addr).await;
+                    }
+                    InversionOutcome::Failure { task_id, error } => {
+                        let ctrl = serde_json::to_string(&serde_json::json!({
+                            "type": "img_result_end",
+                            "taskId": task_id,
+                            "success": false,
+                            "error": error
+                        })).unwrap_or_default();
+                        let _ = write.send(Message::Text(ctrl)).await;
+                    }
+                }
             }
         }
     }
@@ -628,31 +681,132 @@ where
     Ok(())
 }
 
-/// Invert image colors (test feature)
-fn invert_image(base64_image: &str) -> Result<String, String> {
-    use base64::{engine::general_purpose, Engine as _};
+/// Invert image colors from raw bytes, returning raw PNG bytes.
+/// No base64 — used by the binary transfer path.
+fn invert_image_bytes(image_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     use image::ImageFormat;
 
-    // Decode base64 image
-    let image_bytes = general_purpose::STANDARD.decode(base64_image)
-        .map_err(|e| format!("Failed to decode image: {}", e))?;
-
-    // Load image from bytes
     let mut img = image::load_from_memory(&image_bytes)
         .map_err(|e| format!("Failed to load image: {}", e))?;
-
-    // Invert colors
     img.invert();
-
-    // Encode back to PNG bytes
     let mut output_bytes = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut output_bytes), ImageFormat::Png)
         .map_err(|e| format!("Failed to encode PNG: {}", e))?;
+    Ok(output_bytes)
+}
 
-    // Encode to base64
-    let inverted_base64 = general_purpose::STANDARD.encode(&output_bytes);
+/// If no `img_end` arrives within this window after `img_start`, the transfer is discarded.
+const BINARY_TRANSFER_TIMEOUT_SECS: u64 = 30;
 
-    Ok(inverted_base64)
+/// State for a binary image upload in progress (chunked WebSocket frames).
+struct InboundImageTransfer {
+    task_id: String,
+    total_chunks: usize,
+    #[allow(dead_code)]
+    mime: String,
+    chunks: HashMap<u32, Vec<u8>>,
+    started_at: std::time::Instant,
+}
+
+impl InboundImageTransfer {
+    fn new(task_id: String, total_chunks: usize, mime: String) -> Self {
+        Self {
+            task_id,
+            total_chunks,
+            mime,
+            chunks: HashMap::with_capacity(total_chunks),
+            started_at: std::time::Instant::now(),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        self.started_at.elapsed().as_secs() >= BINARY_TRANSFER_TIMEOUT_SECS
+    }
+
+    fn insert_chunk(&mut self, index: u32, data: Vec<u8>) {
+        self.chunks.insert(index, data);
+    }
+
+    fn is_complete(&self) -> bool {
+        self.chunks.len() == self.total_chunks
+    }
+
+    fn assemble(&self) -> Vec<u8> {
+        let total_len: usize = self.chunks.values().map(|v| v.len()).sum();
+        let mut out = Vec::with_capacity(total_len);
+        for i in 0..self.total_chunks as u32 {
+            if let Some(chunk) = self.chunks.get(&i) {
+                out.extend_from_slice(chunk);
+            }
+        }
+        out
+    }
+}
+
+/// Result sent from the `spawn_blocking` inversion task back to the write loop.
+enum InversionOutcome {
+    Success {
+        task_id: String,
+        png_bytes: Vec<u8>,
+        original_bytes: Vec<u8>,
+        addr: String,
+    },
+    Failure {
+        task_id: String,
+        error: String,
+    },
+}
+
+/// Increment when the binary transfer protocol changes in a breaking way.
+/// Must stay in sync with PROTOCOL_VERSION in DeviceLinkingService.ts.
+const PROTOCOL_VERSION: u32 = 1;
+
+const BINARY_CHUNK_SIZE: usize = 65536;
+
+/// Send an inverted PNG back to mobile as binary chunks, then emit the Tauri desktop UI event.
+async fn send_binary_result<S>(
+    write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
+    task_id: &str,
+    png_bytes: &[u8],
+    original_bytes: &[u8],
+    app_handle: &tauri::AppHandle,
+    remote_addr: &str,
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let total_chunks = (png_bytes.len() + BINARY_CHUNK_SIZE - 1) / BINARY_CHUNK_SIZE;
+
+    // 1. result_start control frame
+    let start = serde_json::to_string(&serde_json::json!({
+        "type": "img_result_start",
+        "taskId": task_id,
+        "totalChunks": total_chunks
+    })).unwrap_or_default();
+    if write.send(Message::Text(start)).await.is_err() { return; }
+
+    // 2. binary chunks — [4 bytes uint32 BE: chunk_index][raw PNG bytes]
+    for (i, chunk) in png_bytes.chunks(BINARY_CHUNK_SIZE).enumerate() {
+        let mut frame = Vec::with_capacity(4 + chunk.len());
+        frame.extend_from_slice(&(i as u32).to_be_bytes());
+        frame.extend_from_slice(chunk);
+        if write.send(Message::Binary(frame)).await.is_err() { return; }
+    }
+
+    // 3. result_end control frame
+    let end = serde_json::to_string(&serde_json::json!({
+        "type": "img_result_end",
+        "taskId": task_id,
+        "success": true
+    })).unwrap_or_default();
+    if write.send(Message::Text(end)).await.is_err() { return; }
+
+    // 4. Tauri event for Desktop UI — still base64 (internal IPC, not a WebSocket hop)
+    let _ = app_handle.emit("image-inversion-result", serde_json::json!({
+        "original": general_purpose::STANDARD.encode(original_bytes),
+        "inverted": general_purpose::STANDARD.encode(png_bytes),
+        "device": remote_addr,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }));
 }
 
 #[tauri::command]
