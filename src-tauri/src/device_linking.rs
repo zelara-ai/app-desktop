@@ -5,6 +5,7 @@ use std::io::BufReader;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
@@ -53,10 +54,15 @@ pub struct TaskResponse {
     pub timestamp: String,
 }
 
+/// Shared registry of per-connection push senders (keyed by remote_addr).
+/// Used by `broadcast_progress_sync` to push progress updates to all Mobile clients.
+type ClientSenders = Arc<Mutex<HashMap<String, UnboundedSender<Message>>>>;
+
 pub struct DeviceLinkingState {
     pub linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     pub pairing_token: Arc<Mutex<Option<String>>>,
     pub server_running: Arc<Mutex<bool>>,
+    pub client_senders: ClientSenders,
 }
 
 impl DeviceLinkingState {
@@ -65,6 +71,7 @@ impl DeviceLinkingState {
             linked_devices: Arc::new(Mutex::new(Vec::new())),
             pairing_token: Arc::new(Mutex::new(None)),
             server_running: Arc::new(Mutex::new(false)),
+            client_senders: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -298,10 +305,11 @@ pub async fn start_pairing_server(
     let server_running = state.server_running.clone();
     let pairing_token = state.pairing_token.clone();
     let linked_devices = state.linked_devices.clone();
+    let client_senders = state.client_senders.clone();
 
     // Spawn server task
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&addr, tls_acceptor, server_running, pairing_token, linked_devices, app_handle).await {
+        if let Err(e) = run_websocket_server(&addr, tls_acceptor, server_running, pairing_token, linked_devices, client_senders, app_handle).await {
             eprintln!("WebSocket server error: {}", e);
         }
     });
@@ -315,6 +323,7 @@ async fn run_websocket_server(
     server_running: Arc<Mutex<bool>>,
     pairing_token: Arc<Mutex<Option<String>>>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    client_senders: ClientSenders,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
@@ -334,6 +343,7 @@ async fn run_websocket_server(
                 let remote_addr = addr.to_string();
                 let handle = app_handle.clone();
                 let acceptor = tls_acceptor.clone();
+                let senders = client_senders.clone();
 
                 tokio::spawn(async move {
                     // Wrap TCP stream with TLS
@@ -341,7 +351,7 @@ async fn run_websocket_server(
                         Ok(tls_stream) => {
                             match accept_async(tls_stream).await {
                                 Ok(ws_stream) => {
-                                    if let Err(e) = handle_websocket_connection(ws_stream, token, devices, remote_addr, handle).await {
+                                    if let Err(e) = handle_websocket_connection(ws_stream, token, devices, senders, remote_addr, handle).await {
                                         eprintln!("WebSocket connection error: {}", e);
                                     }
                                 }
@@ -365,10 +375,33 @@ async fn run_websocket_server(
     Ok(())
 }
 
+/// Serialize `progress` as a `progress_sync` JSON text frame and enqueue it
+/// on every connected Mobile client's push channel.
+/// Desktop is authoritative; Mobile adopts the received state.
+fn broadcast_progress_sync(client_senders: &ClientSenders, progress: &crate::storage::UserProgress) {
+    let payload = serde_json::json!({
+        "type": "progress_sync",
+        "points": progress.points,
+        "unlockedModules": progress.unlocked_modules,
+        "availableUnlocks": progress.available_unlocks,
+        "lastUpdated": progress.last_updated,
+    });
+    if let Ok(text) = serde_json::to_string(&payload) {
+        let msg = Message::Text(text);
+        let senders = client_senders.lock().unwrap();
+        for (addr, tx) in senders.iter() {
+            if tx.send(msg.clone()).is_err() {
+                eprintln!("[ProgressSync] dead sender for {}", addr);
+            }
+        }
+    }
+}
+
 async fn handle_websocket_connection<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     expected_token: Option<String>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
+    client_senders: ClientSenders,
     remote_addr: String,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String>
@@ -387,6 +420,13 @@ where
     let (inversion_tx, mut inversion_rx) = tokio::sync::mpsc::channel::<InversionOutcome>(1);
     // State for a binary image upload currently being assembled from chunks.
     let mut inbound_transfer: Option<InboundImageTransfer> = None;
+
+    // Per-connection push channel: broadcast_progress_sync enqueues messages here;
+    // Arm 3 of the select loop drains them and writes to the WebSocket.
+    let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    {
+        client_senders.lock().unwrap().insert(remote_addr.clone(), push_tx);
+    }
 
     'outer: loop {
         tokio::select! {
@@ -537,6 +577,11 @@ where
                             }
                             registered_device_id = Some(stable_id);
                             device_registered = true;
+
+                            // Push current Desktop progress immediately so Mobile starts in sync.
+                            if let Ok(current_progress) = crate::storage::load_progress() {
+                                broadcast_progress_sync(&client_senders, &current_progress);
+                            }
                         }
 
                         // Process task based on type
@@ -550,6 +595,7 @@ where
                                             if result.success {
                                                 if let Ok(updated) = crate::storage::award_points(10) {
                                                     let _ = app_handle.emit("progress-updated", &updated);
+                                                    broadcast_progress_sync(&client_senders, &updated);
                                                 }
                                             }
                                             TaskResponse {
@@ -621,6 +667,25 @@ where
                                     timestamp: chrono::Utc::now().to_rfc3339(),
                                 }
                             }
+                            "request_sync" => {
+                                match crate::storage::load_progress() {
+                                    Ok(p) => {
+                                        broadcast_progress_sync(&client_senders, &p);
+                                        TaskResponse {
+                                            task_id: request.task_id,
+                                            success: true,
+                                            result: serde_json::json!({ "message": "Sync dispatched" }),
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                        }
+                                    }
+                                    Err(e) => TaskResponse {
+                                        task_id: request.task_id,
+                                        success: false,
+                                        result: serde_json::json!({ "error": e }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    }
+                                }
+                            }
                             _ => {
                                 TaskResponse {
                                     task_id: request.task_id,
@@ -658,8 +723,18 @@ where
                     }
                 }
             }
+
+            // ── Arm 3: outbound push messages (progress_sync, etc.) ─────────
+            Some(msg) = push_rx.recv() => {
+                if write.send(msg).await.is_err() {
+                    break 'outer;
+                }
+            }
         }
     }
+
+    // Deregister this connection's push sender so broadcast_progress_sync skips it.
+    client_senders.lock().unwrap().remove(&remote_addr);
 
     // Remove device from the linked list and notify the frontend regardless of
     // whether the connection ended cleanly (Close frame) or due to an error.
@@ -679,6 +754,44 @@ where
     }
 
     Ok(())
+}
+
+/// Tauri command wrapper for award_points — adds broadcast to connected Mobile clients.
+#[tauri::command]
+pub fn award_points(
+    points_to_add: i32,
+    state: State<DeviceLinkingState>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::storage::UserProgress, String> {
+    let updated = crate::storage::award_points(points_to_add)?;
+    let _ = app_handle.emit("progress-updated", &updated);
+    broadcast_progress_sync(&state.client_senders, &updated);
+    Ok(updated)
+}
+
+/// Tauri command wrapper for reset_points — zeros points and broadcasts to connected Mobile clients.
+#[tauri::command]
+pub fn reset_points(
+    state: State<DeviceLinkingState>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::storage::UserProgress, String> {
+    let updated = crate::storage::reset_points()?;
+    let _ = app_handle.emit("progress-updated", &updated);
+    broadcast_progress_sync(&state.client_senders, &updated);
+    Ok(updated)
+}
+
+/// Tauri command wrapper for unlock_module — adds broadcast to connected Mobile clients.
+#[tauri::command]
+pub fn unlock_module(
+    module_name: String,
+    state: State<DeviceLinkingState>,
+    app_handle: tauri::AppHandle,
+) -> Result<crate::storage::UserProgress, String> {
+    let updated = crate::storage::unlock_module(module_name)?;
+    let _ = app_handle.emit("progress-updated", &updated);
+    broadcast_progress_sync(&state.client_senders, &updated);
+    Ok(updated)
 }
 
 /// Invert image colors from raw bytes, returning raw PNG bytes.

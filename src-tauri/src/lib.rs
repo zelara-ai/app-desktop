@@ -49,11 +49,12 @@ pub fn run() {
             ble_advertising::get_ble_status,
             // CV processing commands
             cv_processor::validate_recycling_image,
-            // Storage commands
+            // Storage commands (load/save are direct; award/unlock go via device_linking wrappers for sync)
             storage::load_progress,
             storage::save_progress,
-            storage::award_points,
-            storage::unlock_module,
+            device_linking::award_points,
+            device_linking::reset_points,
+            device_linking::unlock_module,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

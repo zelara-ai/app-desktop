@@ -42,11 +42,20 @@ pub fn load_progress() -> Result<UserProgress, String> {
         return Ok(UserProgress::default());
     }
 
-    let content = fs::read_to_string(&progress_file)
-        .map_err(|e| format!("Failed to read progress file: {}", e))?;
+    let content = match fs::read_to_string(&progress_file) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[storage] Cannot read progress.json ({}), resetting to default", e);
+            let _ = fs::remove_file(&progress_file);
+            return Ok(UserProgress::default());
+        }
+    };
 
-    serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse progress: {}", e))
+    Ok(serde_json::from_str(&content).unwrap_or_else(|e| {
+        eprintln!("[storage] Corrupt progress.json ({}), resetting to default", e);
+        let _ = fs::remove_file(&progress_file);
+        UserProgress::default()
+    }))
 }
 
 #[tauri::command]
@@ -60,7 +69,6 @@ pub fn save_progress(progress: UserProgress) -> Result<(), String> {
         .map_err(|e| format!("Failed to write progress file: {}", e))
 }
 
-#[tauri::command]
 pub fn award_points(points_to_add: i32) -> Result<UserProgress, String> {
     let mut progress = load_progress()?;
     progress.points += points_to_add;
@@ -75,7 +83,12 @@ pub fn award_points(points_to_add: i32) -> Result<UserProgress, String> {
     Ok(progress)
 }
 
-#[tauri::command]
+pub fn reset_points() -> Result<UserProgress, String> {
+    let progress = UserProgress::default();
+    save_progress(progress.clone())?;
+    Ok(progress)
+}
+
 pub fn unlock_module(module_name: String) -> Result<UserProgress, String> {
     let mut progress = load_progress()?;
 

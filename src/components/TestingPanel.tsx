@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { UserProgress } from '@zelara/shared';
 import './TestingPanel.css';
 
 interface DeviceInfo {
@@ -33,6 +34,8 @@ const TestingPanel: React.FC = () => {
   const [localIps, setLocalIps] = useState<string[]>([]);
   const [bleConnectedDevices, setBleConnectedDevices] = useState(0);
   const [bleStatus, setBleStatus] = useState<BleStatus>({ status: 'idle' });
+  const [currentPoints, setCurrentPoints] = useState<number | null>(null);
+  const [awardingPoints, setAwardingPoints] = useState(false);
 
   useEffect(() => {
     // Load current device count from backend
@@ -98,6 +101,16 @@ const TestingPanel: React.FC = () => {
       addLogEntry(label);
     }).then((fn) => unlisteners.push(fn));
 
+    // Load current points for debug display
+    invoke<{ points: number }>('load_progress')
+      .then((p) => setCurrentPoints(p.points))
+      .catch(() => {});
+
+    // Keep point display in sync with progress updates
+    listen<{ points: number }>('progress-updated', (event) => {
+      setCurrentPoints(event.payload.points);
+    }).then((fn) => unlisteners.push(fn));
+
     return () => {
       clearInterval(clockInterval);
       unlisteners.forEach((fn) => fn());
@@ -107,6 +120,32 @@ const TestingPanel: React.FC = () => {
   const addLogEntry = (message: string) => {
     const timestamp = new Date().toLocaleTimeString();
     setTestLog(prev => [`[${timestamp}] ${message}`, ...prev].slice(0, 50));
+  };
+
+  const awardDebugPoints = async (amount: number) => {
+    setAwardingPoints(true);
+    try {
+      const updated = await invoke<{ points: number }>('award_points', { pointsToAdd: amount });
+      setCurrentPoints(updated.points);
+      addLogEntry(`Awarded ${amount} pts → total: ${updated.points}`);
+    } catch (err: any) {
+      addLogEntry(`Award failed: ${err}`);
+    } finally {
+      setAwardingPoints(false);
+    }
+  };
+
+  const resetDebugPoints = async () => {
+    setAwardingPoints(true);
+    try {
+      const updated = await invoke<UserProgress>('reset_points');
+      setCurrentPoints(updated.points);
+      addLogEntry(`Reset points → total: ${updated.points}`);
+    } catch (err: any) {
+      addLogEntry(`Reset failed: ${err}`);
+    } finally {
+      setAwardingPoints(false);
+    }
   };
 
   const primaryIp = localIps[0] ?? '—';
@@ -213,6 +252,44 @@ const TestingPanel: React.FC = () => {
             All interfaces being advertised: <code>{localIps.join(', ')}</code>
           </p>
         )}
+      </div>
+
+      {/* ── Debug: Progress Controls ── */}
+      <div className="testing-section">
+        <h3>Debug: Progress Controls</h3>
+        <p className="section-description">
+          Award points directly — auto-syncs to all connected Mobile devices via WebSocket.
+          Replaces the force-stop + SQLite workflow for dev testing.
+        </p>
+        <p className="section-description">
+          Current points: <strong>{currentPoints !== null ? currentPoints : '…'}</strong>
+        </p>
+        <div className="debug-button-row">
+          <button
+            className="debug-btn"
+            onClick={() => awardDebugPoints(10)}
+            disabled={awardingPoints}>
+            +10 pts
+          </button>
+          <button
+            className="debug-btn"
+            onClick={() => awardDebugPoints(50)}
+            disabled={awardingPoints}>
+            +50 pts
+          </button>
+          <button
+            className="debug-btn debug-btn--danger"
+            onClick={() => awardDebugPoints(9999)}
+            disabled={awardingPoints}>
+            +9999 pts (unlock all)
+          </button>
+          <button
+            className="debug-btn debug-btn--danger"
+            onClick={resetDebugPoints}
+            disabled={awardingPoints}>
+            Reset to 0
+          </button>
+        </div>
       </div>
 
       <div className="testing-section">
