@@ -6544,8 +6544,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "zelara-desktop"
-version = "0.1.0"
+name = "zelara-core"
+version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",

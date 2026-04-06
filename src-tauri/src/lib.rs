@@ -1,9 +1,10 @@
-// Zelara Desktop App - Tauri Backend
+// Zelara Core - Tauri Backend
 
-mod device_linking;
-mod cv_processor;
-mod storage;
+mod ai;
 mod ble_advertising;
+mod cv_processor;
+mod device_linking;
+mod storage;
 
 use device_linking::DeviceLinkingState;
 use cv_processor::CVProcessorState;
@@ -55,6 +56,9 @@ pub fn run() {
             device_linking::award_points,
             device_linking::reset_points,
             device_linking::unlock_module,
+            // AI model management commands
+            ai::model_manager::list_ai_models,
+            ai::model_manager::get_model_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

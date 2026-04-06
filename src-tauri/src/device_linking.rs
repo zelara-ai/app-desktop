@@ -43,6 +43,8 @@ pub struct TaskRequest {
     pub task_type: String,
     pub payload: serde_json::Value,
     pub timestamp: String,
+    #[serde(default)]
+    pub capability: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -684,6 +686,25 @@ where
                                         result: serde_json::json!({ "error": e }),
                                         timestamp: chrono::Utc::now().to_rfc3339(),
                                     }
+                                }
+                            }
+                            "ai_task" => {
+                                let ai_request = crate::ai::AiTaskRequest {
+                                    task_id: request.task_id.clone(),
+                                    capability: request.capability.clone().unwrap_or_default(),
+                                    payload: request.payload.clone(),
+                                };
+                                let ai_response = crate::ai::dispatcher::dispatch(ai_request);
+                                TaskResponse {
+                                    task_id: ai_response.task_id,
+                                    success: ai_response.success,
+                                    result: serde_json::json!({
+                                        "type": "ai_task_result",
+                                        "capability": ai_response.capability,
+                                        "result": ai_response.result,
+                                        "error": ai_response.error,
+                                    }),
+                                    timestamp: chrono::Utc::now().to_rfc3339(),
                                 }
                             }
                             _ => {
