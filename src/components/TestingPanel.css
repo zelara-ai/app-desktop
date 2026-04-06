@@ -163,10 +163,50 @@
   margin: 0 0 4px 0;
 }
 
+.test-result-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .test-result-meta {
   font-size: 12px;
   color: #888;
   margin: 0 0 16px 0;
+}
+
+.image-task-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 96px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.image-task-badge--captured {
+  background: #e8f4fd;
+  color: #1f6aa5;
+}
+
+.image-task-badge--processing {
+  background: #fdf1dd;
+  color: #b36b00;
+}
+
+.image-task-badge--completed {
+  background: #e5f6ed;
+  color: #1f8f57;
+}
+
+.image-task-badge--failed {
+  background: #fde8e8;
+  color: #b63a3a;
 }
 
 .image-comparison {
@@ -196,6 +236,27 @@
   border: 1px solid #ddd;
   border-radius: 8px;
   background-color: #f9f9f9;
+}
+
+.image-placeholder {
+  width: 240px;
+  height: 240px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  border: 1px dashed #c7d2d9;
+  border-radius: 8px;
+  background: linear-gradient(135deg, #f9fbfd 0%, #f0f4f8 100%);
+  color: #6b7f8a;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 16px;
+}
+
+.image-placeholder--processing {
+  background: linear-gradient(135deg, #eef7ff 0%, #f8f1ff 100%);
+  color: #5a4ca3;
 }
 
 .testing-section--row {

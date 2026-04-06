@@ -17,7 +17,6 @@
 /// with E_INVALIDARG on Windows. The company ID (0xFFFE) is sufficient for
 /// filtering. If iOS support is needed in future, consider a scan-response
 /// packet or BLE 5 extended advertising.
-
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
@@ -97,10 +96,7 @@ mod platform {
 
             // ── Manufacturer data — encodes IP:port for the mobile scanner ──
             // Parse IPv4 address into 4 bytes
-            let octets: Vec<u8> = ip
-                .split('.')
-                .filter_map(|s| s.parse::<u8>().ok())
-                .collect();
+            let octets: Vec<u8> = ip.split('.').filter_map(|s| s.parse::<u8>().ok()).collect();
             if octets.len() != 4 {
                 return Err(format!("Invalid IPv4 address for BLE advertisement: {ip}"));
             }
@@ -218,7 +214,8 @@ impl BleAdvertisingState {
 // Tauri commands
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Start BLE advertising using the machine's primary non-loopback IPv4 address.
+/// Start BLE advertising using the machine's preferred LAN-reachable IPv4
+/// address (demoting VPN / virtual adapters where possible).
 /// No-op if already advertising. Returns an error string on failure (non-fatal —
 /// the app continues to work; QR pairing is always available as a fallback).
 #[tauri::command]

@@ -17,18 +17,25 @@ type BleStatus =
   | { status: 'advertising'; ip: string; port: number }
   | { status: 'error'; message: string };
 
-interface InversionResult {
-  original: string;
-  inverted: string;
+interface ImageProcessingState {
+  taskId: string;
+  status: 'captured' | 'processing' | 'completed' | 'failed';
+  message: string;
   device: string;
-  timestamp: string;
+  effectName: string;
+  progress: number;
+  updatedAt: string;
+  originalImage: string | null;
+  originalMime: string;
+  processedImage: string | null;
+  processedMime: string | null;
 }
 
 const TestingPanel: React.FC = () => {
   const [serverRunning] = useState(true); // Server is started when QR is generated
   const [connectedDevices, setConnectedDevices] = useState(0);
   const [testLog, setTestLog] = useState<string[]>([]);
-  const [lastResult, setLastResult] = useState<InversionResult | null>(null);
+  const [latestImageTask, setLatestImageTask] = useState<ImageProcessingState | null>(null);
   const [currentTime, setCurrentTime] = useState(new Date().toLocaleTimeString());
   const [counter, setCounter] = useState<number | null>(null);
   const [localIps, setLocalIps] = useState<string[]>([]);
@@ -51,6 +58,14 @@ const TestingPanel: React.FC = () => {
     // Load current BLE advertising status
     invoke<BleStatus>('get_ble_status')
       .then(setBleStatus)
+      .catch(() => {});
+
+    invoke<ImageProcessingState | null>('get_latest_image_processing_state')
+      .then((task) => {
+        if (task) {
+          setLatestImageTask(task);
+        }
+      })
       .catch(() => {});
 
     // Clock — updates every second
@@ -79,10 +94,17 @@ const TestingPanel: React.FC = () => {
       addLogEntry(`Device disconnected: ${event.payload.id}`);
     }).then((fn) => unlisteners.push(fn));
 
-    // Display image inversion results sent from mobile
-    listen<InversionResult>('image-inversion-result', (event) => {
-      setLastResult(event.payload);
-      addLogEntry(`Image inversion test received from ${event.payload.device}`);
+    listen<ImageProcessingState>('image-processing-state', (event) => {
+      setLatestImageTask(event.payload);
+      const prefix =
+        event.payload.status === 'captured'
+          ? 'Photo preview received'
+          : event.payload.status === 'processing'
+          ? 'Desktop processing started'
+          : event.payload.status === 'completed'
+          ? 'Desktop processing finished'
+          : 'Desktop processing failed';
+      addLogEntry(`${prefix}: ${event.payload.device}`);
     }).then((fn) => unlisteners.push(fn));
 
     // Counter sent from mobile every second
@@ -151,6 +173,16 @@ const TestingPanel: React.FC = () => {
   const primaryIp = localIps[0] ?? '—';
   const isConnected = connectedDevices > 0;
   const bleConnected = bleConnectedDevices > 0;
+  const imageTaskStatusLabel =
+    latestImageTask?.status === 'captured'
+      ? 'Preview Ready'
+      : latestImageTask?.status === 'processing'
+      ? 'Processing'
+      : latestImageTask?.status === 'completed'
+      ? 'Synced'
+      : latestImageTask?.status === 'failed'
+      ? 'Failed'
+      : null;
 
   return (
     <div className="testing-panel">
@@ -296,30 +328,54 @@ const TestingPanel: React.FC = () => {
         <h3>Image Processing Tests</h3>
         <p className="section-description">
           Tests are initiated from mobile devices. Use the Testing screen on mobile to take a
-          photo — it will be sent here, inverted, and the result will appear on both devices.
+          photo — the preview appears here immediately, then Zelara Hub runs the{' '}
+          <strong>{latestImageTask?.effectName ?? 'Spectral Edge Remix'}</strong> and syncs the
+          result back to mobile.
         </p>
       </div>
 
-      {lastResult && (
+      {latestImageTask && (
         <div className="test-result-display">
-          <h3>Last Inversion Test</h3>
+          <div className="test-result-header">
+            <div>
+              <h3>Latest Image Processing Job</h3>
+              <p className="test-result-meta">
+                From: {latestImageTask.device} &nbsp;&middot;&nbsp; {new Date(latestImageTask.updatedAt).toLocaleTimeString()}
+              </p>
+            </div>
+            {imageTaskStatusLabel && (
+              <span className={`image-task-badge image-task-badge--${latestImageTask.status}`}>
+                {imageTaskStatusLabel}
+              </span>
+            )}
+          </div>
           <p className="test-result-meta">
-            From: {lastResult.device} &nbsp;&middot;&nbsp; {new Date(lastResult.timestamp).toLocaleTimeString()}
+            {latestImageTask.message} &nbsp;&middot;&nbsp; {latestImageTask.progress}% complete
           </p>
           <div className="image-comparison">
             <div className="image-comparison-item">
-              <p>Original</p>
-              <img
-                src={`data:image/jpeg;base64,${lastResult.original}`}
-                alt="Original photo from mobile"
-              />
+              <p>Captured on Mobile</p>
+              {latestImageTask.originalImage ? (
+                <img
+                  src={`data:${latestImageTask.originalMime};base64,${latestImageTask.originalImage}`}
+                  alt="Original photo from mobile"
+                />
+              ) : (
+                <div className="image-placeholder">Waiting for preview...</div>
+              )}
             </div>
             <div className="image-comparison-item">
-              <p>Inverted</p>
-              <img
-                src={`data:image/png;base64,${lastResult.inverted}`}
-                alt="Inverted result"
-              />
+              <p>{latestImageTask.effectName}</p>
+              {latestImageTask.processedImage ? (
+                <img
+                  src={`data:${latestImageTask.processedMime ?? 'image/png'};base64,${latestImageTask.processedImage}`}
+                  alt="Desktop-processed result"
+                />
+              ) : (
+                <div className="image-placeholder image-placeholder--processing">
+                  {latestImageTask.status === 'failed' ? 'Processing failed' : 'Desktop processing...'}
+                </div>
+              )}
             </div>
           </div>
         </div>

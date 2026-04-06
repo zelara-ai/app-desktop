@@ -1,22 +1,22 @@
+use base64::{engine::general_purpose, Engine as _};
+use futures_util::{SinkExt, StreamExt};
+use image::Luma;
+use qrcode::QrCode;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
+use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
-use futures_util::{SinkExt, StreamExt};
-use local_ip_address::local_ip;
-use qrcode::QrCode;
-use image::Luma;
-use base64::{engine::general_purpose, Engine as _};
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_rustls::TlsAcceptor;
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DeviceInfo {
@@ -29,7 +29,7 @@ pub struct DeviceInfo {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PairingInfo {
     pub qr_data: String,
-    pub qr_image: String, // Base64-encoded PNG image
+    pub qr_image: String,          // Base64-encoded PNG image
     pub ip_address: String,        // Primary IP for display
     pub ip_addresses: Vec<String>, // All non-loopback IPs
     pub port: u16,
@@ -56,15 +56,33 @@ pub struct TaskResponse {
     pub timestamp: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageProcessingState {
+    pub task_id: String,
+    pub status: String,
+    pub message: String,
+    pub device: String,
+    pub effect_name: String,
+    pub progress: u8,
+    pub updated_at: String,
+    pub original_image: Option<String>,
+    pub original_mime: String,
+    pub processed_image: Option<String>,
+    pub processed_mime: Option<String>,
+}
+
 /// Shared registry of per-connection push senders (keyed by remote_addr).
 /// Used by `broadcast_progress_sync` to push progress updates to all Mobile clients.
 type ClientSenders = Arc<Mutex<HashMap<String, UnboundedSender<Message>>>>;
+type LatestImageProcessing = Arc<Mutex<Option<ImageProcessingState>>>;
 
 pub struct DeviceLinkingState {
     pub linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     pub pairing_token: Arc<Mutex<Option<String>>>,
     pub server_running: Arc<Mutex<bool>>,
     pub client_senders: ClientSenders,
+    pub latest_image_processing: LatestImageProcessing,
 }
 
 impl DeviceLinkingState {
@@ -74,6 +92,7 @@ impl DeviceLinkingState {
             pairing_token: Arc::new(Mutex::new(None)),
             server_running: Arc::new(Mutex::new(false)),
             client_senders: Arc::new(Mutex::new(HashMap::new())),
+            latest_image_processing: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -83,23 +102,25 @@ fn get_local_ip() -> Result<String, String> {
     get_primary_ip_pub()
 }
 
-/// Public helper — used by ble_advertising to get the primary IP for broadcasting.
-pub fn get_primary_ip_pub() -> Result<String, String> {
-    local_ip()
-        .map(|ip| ip.to_string())
-        .map_err(|e| format!("Failed to get local IP: {}", e))
+#[derive(Debug, Clone)]
+struct LocalIpv4Candidate {
+    interface_name: String,
+    ip: Ipv4Addr,
+    netmask: Ipv4Addr,
 }
 
-/// Get all non-loopback IPv4 addresses across all interfaces
-fn get_all_local_ips() -> Vec<String> {
+fn get_local_ipv4_candidates() -> Vec<LocalIpv4Candidate> {
     match if_addrs::get_if_addrs() {
         Ok(interfaces) => interfaces
             .into_iter()
             .filter_map(|iface| {
-                // Keep only IPv4, non-loopback, non-link-local addresses
                 if let if_addrs::IfAddr::V4(v4) = iface.addr {
                     if !v4.ip.is_loopback() && !v4.ip.is_link_local() {
-                        return Some(v4.ip.to_string());
+                        return Some(LocalIpv4Candidate {
+                            interface_name: iface.name,
+                            ip: v4.ip,
+                            netmask: v4.netmask,
+                        });
                     }
                 }
                 None
@@ -109,6 +130,130 @@ fn get_all_local_ips() -> Vec<String> {
     }
 }
 
+fn score_local_ip_candidate(candidate: &LocalIpv4Candidate) -> i32 {
+    let mut score = 0;
+    let name = candidate.interface_name.to_ascii_lowercase();
+    let octets = candidate.ip.octets();
+
+    if candidate.ip.is_private() {
+        score += 50;
+        match octets {
+            [192, 168, _, _] => score += 20,
+            [172, second, _, _] if (16..=31).contains(&second) => score += 15,
+            [10, _, _, _] => score += 10,
+            _ => {}
+        }
+    } else {
+        score -= 25;
+    }
+
+    if candidate.netmask == Ipv4Addr::new(255, 255, 255, 255) {
+        score -= 30;
+    } else {
+        score += 20;
+    }
+
+    if name.contains("wi-fi")
+        || name.contains("wifi")
+        || name.contains("wlan")
+        || name.contains("wireless")
+    {
+        score += 40;
+    }
+    if name.contains("ethernet") || name.starts_with("eth") || name.starts_with("en") {
+        score += 25;
+    }
+    if name.contains("wi-fi direct")
+        || name.contains("mobile hotspot")
+        || name.contains("local area connection")
+    {
+        score += 30;
+    }
+
+    let suspicious_interface_markers = [
+        "protonvpn",
+        "tailscale",
+        "wireguard",
+        "vpn",
+        "tun",
+        "tap",
+        "vethernet",
+        "hyper-v",
+        "wsl",
+        "virtualbox",
+        "vmware",
+        "docker",
+        "container",
+        "loopback",
+    ];
+    if suspicious_interface_markers
+        .iter()
+        .any(|marker| name.contains(marker))
+    {
+        score -= 100;
+    }
+
+    score
+}
+
+fn sort_local_ip_candidates(candidates: &mut [LocalIpv4Candidate]) {
+    candidates.sort_by(|a, b| {
+        score_local_ip_candidate(b)
+            .cmp(&score_local_ip_candidate(a))
+            .then_with(|| a.interface_name.cmp(&b.interface_name))
+            .then_with(|| a.ip.octets().cmp(&b.ip.octets()))
+    });
+}
+
+/// Public helper — used by BLE advertising and QR display to pick the most
+/// LAN-reachable IPv4 address instead of a VPN / virtual adapter.
+pub fn get_primary_ip_pub() -> Result<String, String> {
+    let mut candidates = get_local_ipv4_candidates();
+    if candidates.is_empty() {
+        return Err("Failed to get local IP: no non-loopback IPv4 addresses found".to_string());
+    }
+
+    sort_local_ip_candidates(&mut candidates);
+    let ranked = candidates
+        .iter()
+        .map(|candidate| {
+            format!(
+                "{}@{}(score={})",
+                candidate.ip,
+                candidate.interface_name,
+                score_local_ip_candidate(candidate)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let chosen = &candidates[0];
+    println!(
+        "[DeviceLinking] Selected preferred local IP {} on '{}' from [{}]",
+        chosen.ip, chosen.interface_name, ranked
+    );
+
+    Ok(chosen.ip.to_string())
+}
+
+/// Get all non-loopback IPv4 addresses across all interfaces, ordered with the
+/// most likely LAN-reachable address first.
+fn get_all_local_ips() -> Vec<String> {
+    let mut candidates = get_local_ipv4_candidates();
+    sort_local_ip_candidates(&mut candidates);
+
+    let mut seen = HashSet::new();
+    candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            if seen.insert(candidate.ip) {
+                Some(candidate.ip.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Returns a TLS acceptor backed by a self-signed certificate.
 /// The cert is generated once on first launch and persisted to the app data dir.
 fn create_tls_acceptor() -> Result<TlsAcceptor, String> {
@@ -116,18 +261,17 @@ fn create_tls_acceptor() -> Result<TlsAcceptor, String> {
         .ok_or("Could not locate app data directory")?
         .join("Zelara");
 
-    std::fs::create_dir_all(&cert_dir)
-        .map_err(|e| format!("Failed to create cert dir: {}", e))?;
+    std::fs::create_dir_all(&cert_dir).map_err(|e| format!("Failed to create cert dir: {}", e))?;
 
     let cert_path = cert_dir.join("zelara_cert.pem");
-    let key_path  = cert_dir.join("zelara_key.pem");
+    let key_path = cert_dir.join("zelara_key.pem");
 
     // Generate cert on first run; reuse on subsequent runs
     let (cert_pem, key_pem) = if cert_path.exists() && key_path.exists() {
         let c = std::fs::read_to_string(&cert_path)
             .map_err(|e| format!("Failed to read cert: {}", e))?;
-        let k = std::fs::read_to_string(&key_path)
-            .map_err(|e| format!("Failed to read key: {}", e))?;
+        let k =
+            std::fs::read_to_string(&key_path).map_err(|e| format!("Failed to read key: {}", e))?;
         (c, k)
     } else {
         let subject_alt_names = vec!["zelara.local".to_string(), "localhost".to_string()];
@@ -136,11 +280,12 @@ fn create_tls_acceptor() -> Result<TlsAcceptor, String> {
                 .map_err(|e| format!("Cert generation failed: {}", e))?;
         let c = cert.pem();
         let k = key_pair.serialize_pem();
-        std::fs::write(&cert_path, &c)
-            .map_err(|e| format!("Failed to write cert: {}", e))?;
-        std::fs::write(&key_path, &k)
-            .map_err(|e| format!("Failed to write key: {}", e))?;
-        println!("Generated new self-signed TLS certificate at {:?}", cert_dir);
+        std::fs::write(&cert_path, &c).map_err(|e| format!("Failed to write cert: {}", e))?;
+        std::fs::write(&key_path, &k).map_err(|e| format!("Failed to write key: {}", e))?;
+        println!(
+            "Generated new self-signed TLS certificate at {:?}",
+            cert_dir
+        );
         (c, k)
     };
 
@@ -173,7 +318,11 @@ fn cert_fingerprint_base64(cert_pem: &str) -> Result<String, String> {
         .map_err(|e| format!("Failed to parse cert PEM: {}", e))?;
     let hash = Sha256::digest(der.as_ref());
     let fp = general_purpose::STANDARD.encode(hash);
-    println!("[ZelaraTLS] cert_fingerprint_base64: {} (len={})", fp, fp.len());
+    println!(
+        "[ZelaraTLS] cert_fingerprint_base64: {} (len={})",
+        fp,
+        fp.len()
+    );
     Ok(fp)
 }
 
@@ -208,7 +357,11 @@ pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo,
 
     // Encode all IPs comma-separated so mobile can try each one
     let ips_encoded = ip_addresses.join(",");
-    println!("[ZelaraTLS] QR cert param: {} (len={})", cert_fp, cert_fp.len());
+    println!(
+        "[ZelaraTLS] QR cert param: {} (len={})",
+        cert_fp,
+        cert_fp.len()
+    );
     let qr_data = format!(
         "zelara://pair?ips={}&port={}&token={}&cert={}",
         ips_encoded, port, token, cert_fp
@@ -219,13 +372,15 @@ pub fn generate_qr_code(state: State<DeviceLinkingState>) -> Result<PairingInfo,
         .map_err(|e| format!("Failed to generate QR code: {}", e))?;
 
     // Render to image with scale factor for better visibility
-    let image = code.render::<Luma<u8>>()
-        .min_dimensions(400, 400)
-        .build();
+    let image = code.render::<Luma<u8>>().min_dimensions(400, 400).build();
 
     // Convert to PNG bytes
     let mut png_bytes = Vec::new();
-    image.write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+    image
+        .write_to(
+            &mut std::io::Cursor::new(&mut png_bytes),
+            image::ImageFormat::Png,
+        )
         .map_err(|e| format!("Failed to encode PNG: {}", e))?;
 
     // Encode as base64
@@ -279,7 +434,13 @@ pub async fn start_pairing_server(
     #[cfg(target_os = "windows")]
     {
         let rule_exists = std::process::Command::new("netsh")
-            .args(["advfirewall", "firewall", "show", "rule", "name=Zelara Device Linking"])
+            .args([
+                "advfirewall",
+                "firewall",
+                "show",
+                "rule",
+                "name=Zelara Device Linking",
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -308,10 +469,22 @@ pub async fn start_pairing_server(
     let pairing_token = state.pairing_token.clone();
     let linked_devices = state.linked_devices.clone();
     let client_senders = state.client_senders.clone();
+    let latest_image_processing = state.latest_image_processing.clone();
 
     // Spawn server task
     tokio::spawn(async move {
-        if let Err(e) = run_websocket_server(&addr, tls_acceptor, server_running, pairing_token, linked_devices, client_senders, app_handle).await {
+        if let Err(e) = run_websocket_server(
+            &addr,
+            tls_acceptor,
+            server_running,
+            pairing_token,
+            linked_devices,
+            client_senders,
+            latest_image_processing,
+            app_handle,
+        )
+        .await
+        {
             eprintln!("WebSocket server error: {}", e);
         }
     });
@@ -326,6 +499,7 @@ async fn run_websocket_server(
     pairing_token: Arc<Mutex<Option<String>>>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     client_senders: ClientSenders,
+    latest_image_processing: LatestImageProcessing,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
@@ -346,22 +520,31 @@ async fn run_websocket_server(
                 let handle = app_handle.clone();
                 let acceptor = tls_acceptor.clone();
                 let senders = client_senders.clone();
+                let latest_processing = latest_image_processing.clone();
 
                 tokio::spawn(async move {
                     // Wrap TCP stream with TLS
                     match acceptor.accept(stream).await {
-                        Ok(tls_stream) => {
-                            match accept_async(tls_stream).await {
-                                Ok(ws_stream) => {
-                                    if let Err(e) = handle_websocket_connection(ws_stream, token, devices, senders, remote_addr, handle).await {
-                                        eprintln!("WebSocket connection error: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("WebSocket handshake error: {}", e);
+                        Ok(tls_stream) => match accept_async(tls_stream).await {
+                            Ok(ws_stream) => {
+                                if let Err(e) = handle_websocket_connection(
+                                    ws_stream,
+                                    token,
+                                    devices,
+                                    senders,
+                                    latest_processing,
+                                    remote_addr,
+                                    handle,
+                                )
+                                .await
+                                {
+                                    eprintln!("WebSocket connection error: {}", e);
                                 }
                             }
-                        }
+                            Err(e) => {
+                                eprintln!("WebSocket handshake error: {}", e);
+                            }
+                        },
                         Err(e) => {
                             eprintln!("TLS handshake error: {}", e);
                         }
@@ -380,7 +563,10 @@ async fn run_websocket_server(
 /// Serialize `progress` as a `progress_sync` JSON text frame and enqueue it
 /// on every connected Mobile client's push channel.
 /// Desktop is authoritative; Mobile adopts the received state.
-fn broadcast_progress_sync(client_senders: &ClientSenders, progress: &crate::storage::UserProgress) {
+fn broadcast_progress_sync(
+    client_senders: &ClientSenders,
+    progress: &crate::storage::UserProgress,
+) {
     let payload = serde_json::json!({
         "type": "progress_sync",
         "points": progress.points,
@@ -399,11 +585,55 @@ fn broadcast_progress_sync(client_senders: &ClientSenders, progress: &crate::sto
     }
 }
 
+const IMAGE_PROCESSING_EFFECT_NAME: &str = "Spectral Edge Remix";
+
+fn image_processing_message(snapshot: &ImageProcessingState) -> Option<Message> {
+    let mut payload = serde_json::to_value(snapshot).ok()?;
+    payload.as_object_mut()?.insert(
+        "type".to_string(),
+        serde_json::Value::String("image_processing_sync".to_string()),
+    );
+    serde_json::to_string(&payload).ok().map(Message::Text)
+}
+
+fn publish_image_processing_state(
+    latest_image_processing: &LatestImageProcessing,
+    client_senders: &ClientSenders,
+    app_handle: &tauri::AppHandle,
+    snapshot: ImageProcessingState,
+) {
+    *latest_image_processing.lock().unwrap() = Some(snapshot.clone());
+    let _ = app_handle.emit("image-processing-state", &snapshot);
+
+    if let Some(msg) = image_processing_message(&snapshot) {
+        let senders = client_senders.lock().unwrap();
+        for tx in senders.values() {
+            let _ = tx.send(msg.clone());
+        }
+    }
+}
+
+fn rebroadcast_latest_image_processing_state(
+    latest_image_processing: &LatestImageProcessing,
+    client_senders: &ClientSenders,
+) {
+    let snapshot = latest_image_processing.lock().unwrap().clone();
+    if let Some(snapshot) = snapshot {
+        if let Some(msg) = image_processing_message(&snapshot) {
+            let senders = client_senders.lock().unwrap();
+            for tx in senders.values() {
+                let _ = tx.send(msg.clone());
+            }
+        }
+    }
+}
+
 async fn handle_websocket_connection<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     expected_token: Option<String>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     client_senders: ClientSenders,
+    latest_image_processing: LatestImageProcessing,
     remote_addr: String,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String>
@@ -427,7 +657,10 @@ where
     // Arm 3 of the select loop drains them and writes to the WebSocket.
     let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
     {
-        client_senders.lock().unwrap().insert(remote_addr.clone(), push_tx);
+        client_senders
+            .lock()
+            .unwrap()
+            .insert(remote_addr.clone(), push_tx);
     }
 
     'outer: loop {
@@ -470,6 +703,40 @@ where
                         // Check for binary transfer control messages before parsing as TaskRequest.
                         if let Ok(ctrl) = serde_json::from_str::<serde_json::Value>(&text) {
                             match ctrl.get("type").and_then(|t| t.as_str()) {
+                                Some("img_preview") => {
+                                    if !device_registered {
+                                        eprintln!("[BinaryXfer] img_preview received before handshake completion");
+                                        continue 'outer;
+                                    }
+
+                                    let task_id = ctrl["taskId"].as_str().unwrap_or("").to_string();
+                                    let original_base64 = ctrl["originalBase64"].as_str().unwrap_or("").to_string();
+                                    let mime = ctrl["mime"].as_str().unwrap_or("image/jpeg").to_string();
+                                    if task_id.is_empty() || original_base64.is_empty() {
+                                        eprintln!("[BinaryXfer] img_preview missing taskId or originalBase64");
+                                        continue 'outer;
+                                    }
+
+                                    publish_image_processing_state(
+                                        &latest_image_processing,
+                                        &client_senders,
+                                        &app_handle,
+                                        ImageProcessingState {
+                                            task_id,
+                                            status: "captured".to_string(),
+                                            message: "Photo captured on mobile. Waiting for desktop processing.".to_string(),
+                                            device: remote_addr.clone(),
+                                            effect_name: IMAGE_PROCESSING_EFFECT_NAME.to_string(),
+                                            progress: 10,
+                                            updated_at: chrono::Utc::now().to_rfc3339(),
+                                            original_image: Some(original_base64),
+                                            original_mime: mime,
+                                            processed_image: None,
+                                            processed_mime: None,
+                                        },
+                                    );
+                                    continue 'outer;
+                                }
                                 Some("img_start") => {
                                     let task_id = ctrl["taskId"].as_str().unwrap_or("").to_string();
                                     let total = ctrl["totalChunks"].as_u64().unwrap_or(0) as usize;
@@ -489,13 +756,37 @@ where
                                         if transfer.task_id == task_id && transfer.is_complete() {
                                             let assembled = transfer.assemble();
                                             let original = assembled.clone();
+                                            let original_base64 = general_purpose::STANDARD.encode(&original);
+                                            let original_mime = transfer.mime.clone();
+                                            publish_image_processing_state(
+                                                &latest_image_processing,
+                                                &client_senders,
+                                                &app_handle,
+                                                ImageProcessingState {
+                                                    task_id: task_id.clone(),
+                                                    status: "processing".to_string(),
+                                                    message: "Zelara Hub is building the spectral edge remix.".to_string(),
+                                                    device: remote_addr.clone(),
+                                                    effect_name: IMAGE_PROCESSING_EFFECT_NAME.to_string(),
+                                                    progress: 55,
+                                                    updated_at: chrono::Utc::now().to_rfc3339(),
+                                                    original_image: Some(original_base64.clone()),
+                                                    original_mime: original_mime.clone(),
+                                                    processed_image: None,
+                                                    processed_mime: None,
+                                                },
+                                            );
                                             let tid = task_id.clone();
                                             let tx = inversion_tx.clone();
                                             let addr = remote_addr.clone();
+                                            let original_base64_for_result = original_base64.clone();
+                                            let original_base64_for_error = original_base64.clone();
+                                            let original_mime_for_result = original_mime.clone();
+                                            let original_mime_for_error = original_mime.clone();
                                             tokio::task::spawn_blocking(move || {
-                                                match invert_image_bytes(assembled) {
-                                                    Ok(png) => { let _ = tx.blocking_send(InversionOutcome::Success { task_id: tid, png_bytes: png, original_bytes: original, addr }); }
-                                                    Err(e) => { let _ = tx.blocking_send(InversionOutcome::Failure { task_id: tid, error: e }); }
+                                                match render_spectral_edge_remix(assembled) {
+                                                    Ok(png) => { let _ = tx.blocking_send(InversionOutcome::Success { task_id: tid, png_bytes: png, original_bytes: original, original_base64: original_base64_for_result, original_mime: original_mime_for_result, addr }); }
+                                                    Err(e) => { let _ = tx.blocking_send(InversionOutcome::Failure { task_id: tid, error: e, original_base64: Some(original_base64_for_error), original_mime: Some(original_mime_for_error), addr }); }
                                                 }
                                             });
                                         } else {
@@ -584,6 +875,10 @@ where
                             if let Ok(current_progress) = crate::storage::load_progress() {
                                 broadcast_progress_sync(&client_senders, &current_progress);
                             }
+                            rebroadcast_latest_image_processing_state(
+                                &latest_image_processing,
+                                &client_senders,
+                            );
                         }
 
                         // Process task based on type
@@ -730,17 +1025,66 @@ where
             // ── Arm 2: inversion task completed on blocking thread pool ────
             Some(outcome) = inversion_rx.recv() => {
                 match outcome {
-                    InversionOutcome::Success { task_id, png_bytes, original_bytes, addr } => {
+                    InversionOutcome::Success {
+                        task_id,
+                        png_bytes,
+                        original_bytes,
+                        original_base64,
+                        original_mime,
+                        addr,
+                    } => {
                         send_binary_result(&mut write, &task_id, &png_bytes, &original_bytes, &app_handle, &addr).await;
+                        publish_image_processing_state(
+                            &latest_image_processing,
+                            &client_senders,
+                            &app_handle,
+                            ImageProcessingState {
+                                task_id,
+                                status: "completed".to_string(),
+                                message: "Desktop processing finished. Result synced back to mobile.".to_string(),
+                                device: addr,
+                                effect_name: IMAGE_PROCESSING_EFFECT_NAME.to_string(),
+                                progress: 100,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                                original_image: Some(original_base64),
+                                original_mime,
+                                processed_image: Some(general_purpose::STANDARD.encode(&png_bytes)),
+                                processed_mime: Some("image/png".to_string()),
+                            },
+                        );
                     }
-                    InversionOutcome::Failure { task_id, error } => {
+                    InversionOutcome::Failure {
+                        task_id,
+                        error,
+                        original_base64,
+                        original_mime,
+                        addr,
+                    } => {
                         let ctrl = serde_json::to_string(&serde_json::json!({
                             "type": "img_result_end",
-                            "taskId": task_id,
+                            "taskId": task_id.clone(),
                             "success": false,
-                            "error": error
+                            "error": error.clone()
                         })).unwrap_or_default();
                         let _ = write.send(Message::Text(ctrl)).await;
+                        publish_image_processing_state(
+                            &latest_image_processing,
+                            &client_senders,
+                            &app_handle,
+                            ImageProcessingState {
+                                task_id,
+                                status: "failed".to_string(),
+                                message: error,
+                                device: addr,
+                                effect_name: IMAGE_PROCESSING_EFFECT_NAME.to_string(),
+                                progress: 100,
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                                original_image: original_base64,
+                                original_mime: original_mime.unwrap_or_else(|| "image/jpeg".to_string()),
+                                processed_image: None,
+                                processed_mime: None,
+                            },
+                        );
                     }
                 }
             }
@@ -761,17 +1105,21 @@ where
     // whether the connection ended cleanly (Close frame) or due to an error.
     if let Some(id) = registered_device_id {
         let mut devices = linked_devices.lock().unwrap();
-        let removed_method = devices.iter()
+        let removed_method = devices
+            .iter()
             .find(|d| d.id == id)
             .map(|d| d.discovery_method.clone())
             .unwrap_or_else(|| "qr".to_string());
         devices.retain(|d| d.id != id);
         drop(devices);
         println!("Device disconnected and removed: {}", id);
-        let _ = app_handle.emit("device-disconnected", serde_json::json!({
-            "id": id,
-            "discovery_method": removed_method
-        }));
+        let _ = app_handle.emit(
+            "device-disconnected",
+            serde_json::json!({
+                "id": id,
+                "discovery_method": removed_method
+            }),
+        );
     }
 
     Ok(())
@@ -817,16 +1165,107 @@ pub fn unlock_module(
 
 /// Invert image colors from raw bytes, returning raw PNG bytes.
 /// No base64 — used by the binary transfer path.
-fn invert_image_bytes(image_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
-    use image::ImageFormat;
+fn render_spectral_edge_remix(image_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    use image::{DynamicImage, GrayImage, ImageFormat, Luma, Rgba, RgbaImage};
 
-    let mut img = image::load_from_memory(&image_bytes)
-        .map_err(|e| format!("Failed to load image: {}", e))?;
-    img.invert();
+    let rgba = image::load_from_memory(&image_bytes)
+        .map_err(|e| format!("Failed to load image: {}", e))?
+        .to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    let grayscale = DynamicImage::ImageRgba8(rgba.clone())
+        .grayscale()
+        .to_luma8();
+    let blurred = image::imageops::blur(&grayscale, 2.2);
+    let mut edges = GrayImage::new(width, height);
+
+    for y in 0..height {
+        for x in 0..width {
+            let x = x as i32;
+            let y = y as i32;
+            let gx = -sample_luma(&blurred, x - 1, y - 1) + sample_luma(&blurred, x + 1, y - 1)
+                - 2.0 * sample_luma(&blurred, x - 1, y)
+                + 2.0 * sample_luma(&blurred, x + 1, y)
+                - sample_luma(&blurred, x - 1, y + 1)
+                + sample_luma(&blurred, x + 1, y + 1);
+            let gy = sample_luma(&blurred, x - 1, y - 1)
+                + 2.0 * sample_luma(&blurred, x, y - 1)
+                + sample_luma(&blurred, x + 1, y - 1)
+                - sample_luma(&blurred, x - 1, y + 1)
+                - 2.0 * sample_luma(&blurred, x, y + 1)
+                - sample_luma(&blurred, x + 1, y + 1);
+            let magnitude = (gx.mul_add(gx, gy * gy)).sqrt().min(255.0) as u8;
+            edges.put_pixel(x as u32, y as u32, Luma([magnitude]));
+        }
+    }
+
+    let center_x = (width.saturating_sub(1)) as f32 / 2.0;
+    let center_y = (height.saturating_sub(1)) as f32 / 2.0;
+    let max_distance = (center_x.mul_add(center_x, center_y * center_y))
+        .sqrt()
+        .max(1.0);
+    let mut output = RgbaImage::new(width, height);
+
+    for y in 0..height {
+        for x in 0..width {
+            let original = rgba.get_pixel(x, y).0;
+            let tone = blurred.get_pixel(x, y)[0] as f32 / 255.0;
+            let edge = edges.get_pixel(x, y)[0] as f32 / 255.0;
+            let dx = x as f32 - center_x;
+            let dy = y as f32 - center_y;
+            let vignette =
+                (1.0 - 0.28 * ((dx.mul_add(dx, dy * dy)).sqrt() / max_distance)).clamp(0.72, 1.0);
+            let highlight = (1.0 - tone).powf(1.25);
+            let shadow = tone.powf(1.1);
+
+            let mut red = ((255 - original[2]) as f32 * 0.18
+                + edge * 235.0
+                + highlight * 75.0
+                + shadow * 15.0)
+                * vignette;
+            let mut green =
+                ((255 - original[1]) as f32 * 0.48 + edge * 170.0 + highlight * 105.0) * vignette;
+            let mut blue =
+                ((255 - original[0]) as f32 * 0.82 + edge * 255.0 + highlight * 145.0) * vignette;
+
+            let warm_accent = original[0] as f32 / 255.0 * 45.0 * (1.0 - edge * 0.45);
+            red += warm_accent;
+            green += warm_accent * 0.18;
+            blue += (1.0 - shadow) * 24.0;
+
+            output.put_pixel(
+                x,
+                y,
+                Rgba([
+                    posterize(red, 6),
+                    posterize(green, 6),
+                    posterize(blue, 7),
+                    original[3],
+                ]),
+            );
+        }
+    }
+
     let mut output_bytes = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut output_bytes), ImageFormat::Png)
+    DynamicImage::ImageRgba8(output)
+        .write_to(
+            &mut std::io::Cursor::new(&mut output_bytes),
+            ImageFormat::Png,
+        )
         .map_err(|e| format!("Failed to encode PNG: {}", e))?;
     Ok(output_bytes)
+}
+
+fn sample_luma(image: &image::GrayImage, x: i32, y: i32) -> f32 {
+    let clamped_x = x.clamp(0, image.width().saturating_sub(1) as i32) as u32;
+    let clamped_y = y.clamp(0, image.height().saturating_sub(1) as i32) as u32;
+    image.get_pixel(clamped_x, clamped_y)[0] as f32
+}
+
+fn posterize(value: f32, levels: u8) -> u8 {
+    let levels = levels.max(2) as f32;
+    let step = 255.0 / (levels - 1.0);
+    ((value.clamp(0.0, 255.0) / step).round() * step).clamp(0.0, 255.0) as u8
 }
 
 /// If no `img_end` arrives within this window after `img_start`, the transfer is discarded.
@@ -883,11 +1322,16 @@ enum InversionOutcome {
         task_id: String,
         png_bytes: Vec<u8>,
         original_bytes: Vec<u8>,
+        original_base64: String,
+        original_mime: String,
         addr: String,
     },
     Failure {
         task_id: String,
         error: String,
+        original_base64: Option<String>,
+        original_mime: Option<String>,
+        addr: String,
     },
 }
 
@@ -897,7 +1341,8 @@ const PROTOCOL_VERSION: u32 = 1;
 
 const BINARY_CHUNK_SIZE: usize = 65536;
 
-/// Send an inverted PNG back to mobile as binary chunks, then emit the Tauri desktop UI event.
+/// Send the processed PNG back to mobile as binary chunks, then emit the legacy
+/// Tauri desktop UI event for the current TestingPanel consumer.
 async fn send_binary_result<S>(
     write: &mut futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>,
     task_id: &str,
@@ -915,15 +1360,20 @@ async fn send_binary_result<S>(
         "type": "img_result_start",
         "taskId": task_id,
         "totalChunks": total_chunks
-    })).unwrap_or_default();
-    if write.send(Message::Text(start)).await.is_err() { return; }
+    }))
+    .unwrap_or_default();
+    if write.send(Message::Text(start)).await.is_err() {
+        return;
+    }
 
     // 2. binary chunks — [4 bytes uint32 BE: chunk_index][raw PNG bytes]
     for (i, chunk) in png_bytes.chunks(BINARY_CHUNK_SIZE).enumerate() {
         let mut frame = Vec::with_capacity(4 + chunk.len());
         frame.extend_from_slice(&(i as u32).to_be_bytes());
         frame.extend_from_slice(chunk);
-        if write.send(Message::Binary(frame)).await.is_err() { return; }
+        if write.send(Message::Binary(frame)).await.is_err() {
+            return;
+        }
     }
 
     // 3. result_end control frame
@@ -931,16 +1381,29 @@ async fn send_binary_result<S>(
         "type": "img_result_end",
         "taskId": task_id,
         "success": true
-    })).unwrap_or_default();
-    if write.send(Message::Text(end)).await.is_err() { return; }
+    }))
+    .unwrap_or_default();
+    if write.send(Message::Text(end)).await.is_err() {
+        return;
+    }
 
     // 4. Tauri event for Desktop UI — still base64 (internal IPC, not a WebSocket hop)
-    let _ = app_handle.emit("image-inversion-result", serde_json::json!({
-        "original": general_purpose::STANDARD.encode(original_bytes),
-        "inverted": general_purpose::STANDARD.encode(png_bytes),
-        "device": remote_addr,
-        "timestamp": chrono::Utc::now().to_rfc3339()
-    }));
+    let _ = app_handle.emit(
+        "image-inversion-result",
+        serde_json::json!({
+            "original": general_purpose::STANDARD.encode(original_bytes),
+            "inverted": general_purpose::STANDARD.encode(png_bytes),
+            "device": remote_addr,
+            "timestamp": chrono::Utc::now().to_rfc3339()
+        }),
+    );
+}
+
+#[tauri::command]
+pub fn get_latest_image_processing_state(
+    state: State<DeviceLinkingState>,
+) -> Option<ImageProcessingState> {
+    state.latest_image_processing.lock().unwrap().clone()
 }
 
 #[tauri::command]

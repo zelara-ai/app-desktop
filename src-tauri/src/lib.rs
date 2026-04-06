@@ -6,9 +6,9 @@ mod cv_processor;
 mod device_linking;
 mod storage;
 
-use device_linking::DeviceLinkingState;
-use cv_processor::CVProcessorState;
 use ble_advertising::BleAdvertisingState;
+use cv_processor::CVProcessorState;
+use device_linking::DeviceLinkingState;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -44,6 +44,7 @@ pub fn run() {
             device_linking::start_pairing_server,
             device_linking::stop_pairing_server,
             device_linking::get_local_ips,
+            device_linking::get_latest_image_processing_state,
             // BLE auto-discovery commands
             ble_advertising::start_ble_advertising,
             ble_advertising::stop_ble_advertising,
