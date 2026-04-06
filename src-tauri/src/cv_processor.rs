@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
-use tauri::State;
 use base64::{engine::general_purpose, Engine as _};
 use image::DynamicImage;
+use serde::{Deserialize, Serialize};
+use tauri::State;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ValidationResult {
@@ -85,11 +85,21 @@ fn analyze_bag_material(img: &DynamicImage) -> (bool, f32, String) {
     };
 
     let message = if is_paper {
-        format!("Paper bag detected (avg color: R{} G{} B{}, {}% brown match)",
-                avg_r, avg_g, avg_b, (brown_ratio * 100.0) as u32)
+        format!(
+            "Paper bag detected (avg color: R{} G{} B{}, {}% brown match)",
+            avg_r,
+            avg_g,
+            avg_b,
+            (brown_ratio * 100.0) as u32
+        )
     } else {
-        format!("Possible plastic or non-paper material (avg color: R{} G{} B{}, {}% brown match)",
-                avg_r, avg_g, avg_b, (brown_ratio * 100.0) as u32)
+        format!(
+            "Possible plastic or non-paper material (avg color: R{} G{} B{}, {}% brown match)",
+            avg_r,
+            avg_g,
+            avg_b,
+            (brown_ratio * 100.0) as u32
+        )
     };
 
     (is_paper, confidence, message)
@@ -98,7 +108,8 @@ fn analyze_bag_material(img: &DynamicImage) -> (bool, f32, String) {
 /// Core validation logic (can be called from anywhere)
 pub fn validate_image(image_data: &str) -> Result<ValidationResult, String> {
     // Decode base64 image
-    let image_bytes = general_purpose::STANDARD.decode(image_data)
+    let image_bytes = general_purpose::STANDARD
+        .decode(image_data)
         .map_err(|e| format!("Failed to decode image: {}", e))?;
 
     // Load image from bytes

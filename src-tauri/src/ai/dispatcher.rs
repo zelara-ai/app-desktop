@@ -1,10 +1,10 @@
-use super::{AiTaskRequest, AiTaskResponse, AiTaskError};
+use super::{AiTaskError, AiTaskRequest, AiTaskResponse};
 
 pub fn dispatch(request: AiTaskRequest) -> AiTaskResponse {
     let result: Result<serde_json::Value, AiTaskError> = match request.capability.as_str() {
-        "ocr_receipt"            => super::ocr_receipt::handle(&request),
+        "ocr_receipt" => super::ocr_receipt::handle(&request),
         "categorize_transaction" => super::categorization::handle(&request),
-        _                        => Err(AiTaskError::NotYetImplemented),
+        _ => Err(AiTaskError::NotYetImplemented),
     };
 
     match result {

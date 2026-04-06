@@ -27,7 +27,8 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
     let data_dir = home_dir.join(".zelara");
 
     if !data_dir.exists() {
-        fs::create_dir_all(&data_dir).map_err(|e| format!("Failed to create data directory: {}", e))?;
+        fs::create_dir_all(&data_dir)
+            .map_err(|e| format!("Failed to create data directory: {}", e))?;
     }
 
     Ok(data_dir)
@@ -45,14 +46,20 @@ pub fn load_progress() -> Result<UserProgress, String> {
     let content = match fs::read_to_string(&progress_file) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[storage] Cannot read progress.json ({}), resetting to default", e);
+            eprintln!(
+                "[storage] Cannot read progress.json ({}), resetting to default",
+                e
+            );
             let _ = fs::remove_file(&progress_file);
             return Ok(UserProgress::default());
         }
     };
 
     Ok(serde_json::from_str(&content).unwrap_or_else(|e| {
-        eprintln!("[storage] Corrupt progress.json ({}), resetting to default", e);
+        eprintln!(
+            "[storage] Corrupt progress.json ({}), resetting to default",
+            e
+        );
         let _ = fs::remove_file(&progress_file);
         UserProgress::default()
     }))
@@ -65,8 +72,7 @@ pub fn save_progress(progress: UserProgress) -> Result<(), String> {
     let content = serde_json::to_string_pretty(&progress)
         .map_err(|e| format!("Failed to serialize progress: {}", e))?;
 
-    fs::write(&progress_file, content)
-        .map_err(|e| format!("Failed to write progress file: {}", e))
+    fs::write(&progress_file, content).map_err(|e| format!("Failed to write progress file: {}", e))
 }
 
 pub fn award_points(points_to_add: i32) -> Result<UserProgress, String> {

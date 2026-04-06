@@ -4,8 +4,8 @@ use serde::Serialize;
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
-    pub format: String,      // "onnx" | "gguf"
-    pub capability: String,  // "ocr_receipt" | "categorize_transaction"
+    pub format: String,     // "onnx" | "gguf"
+    pub capability: String, // "ocr_receipt" | "categorize_transaction"
     pub loaded: bool,
     pub size_mb: Option<f64>,
 }
