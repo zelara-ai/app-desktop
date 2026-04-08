@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "paddleocr-det-v4-en",
+      "name": "PaddleOCR Detection v5 Mobile (English)",
+      "capability": "ocr_receipt",
+      "role": "detector",
+      "format": "onnx",
+      "download_url": "https://huggingface.co/nathanfhh/PaddleOCR-ONNX/resolve/main/PP-OCRv5_mobile_det.onnx",
+      "sha256": "1eb7b4f7ab657ebd1c66d5f79bca7497f29768a2e3c15e52daecbba1a8e4a039",
+      "size_mb": 4.83,
+      "tier_min": "light"
+    },
+    {
+      "id": "paddleocr-rec-v4-en",
+      "name": "PaddleOCR Recognition v5 Mobile (English)",
+      "capability": "ocr_receipt",
+      "role": "recognizer",
+      "format": "onnx",
+      "download_url": "https://huggingface.co/nathanfhh/PaddleOCR-ONNX/resolve/main/PP-OCRv5_mobile_rec.onnx",
+      "sha256": "97bf271c4d81935ce6f4990a95615d4f46029aec5c9b582c36eeecd5e8870ef1",
+      "size_mb": 16.6,
+      "tier_min": "light"
+    },
+    {
+      "id": "minilm-l6-v2",
+      "name": "MiniLM-L6 Sentence Embedder (ARM64 quantized)",
+      "capability": "categorize_transaction",
+      "role": "embedder",
+      "format": "onnx",
+      "download_url": "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/onnx/model_qint8_arm64.onnx",
+      "sha256": "4278337fd0ff3c68bfb6291042cad8ab363e1d9fbc43dcb499fe91c871902474",
+      "size_mb": 23.0,
+      "tier_min": "light"
+    }
+  ]
+}

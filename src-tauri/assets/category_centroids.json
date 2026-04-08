@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "categories": [
+    {
+      "categoryId": "groceries",
+      "phrases": ["supermarket", "grocery", "aldi", "lidl", "edeka", "rewe", "whole foods", "walmart", "target", "market"]
+    },
+    {
+      "categoryId": "dining",
+      "phrases": ["restaurant", "cafe", "coffee", "espresso", "bakery", "takeaway", "pizza", "burger", "bar", "food delivery"]
+    },
+    {
+      "categoryId": "transport",
+      "phrases": ["uber", "lyft", "taxi", "train", "bus", "shell", "esso", "bp", "parking", "fuel", "gas station"]
+    },
+    {
+      "categoryId": "utilities",
+      "phrases": ["electric", "water", "internet", "mobile bill", "phone bill", "utility", "telekom", "vodafone", "o2", "broadband"]
+    },
+    {
+      "categoryId": "entertainment",
+      "phrases": ["netflix", "spotify", "cinema", "movie", "gaming", "steam", "xbox", "playstation", "concert", "subscription"]
+    },
+    {
+      "categoryId": "health",
+      "phrases": ["pharmacy", "doctor", "dentist", "hospital", "clinic", "medication", "apotheke", "wellness", "fitness", "gym"]
+    },
+    {
+      "categoryId": "shopping",
+      "phrases": ["amazon", "ikea", "mall", "retail", "fashion", "clothing", "electronics", "store", "online order", "boutique"]
+    }
+  ]
+}

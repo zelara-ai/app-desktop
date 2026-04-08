@@ -3,7 +3,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { UserProgress } from '@zelara/shared';
 import './App.css';
+import AiModels from './components/AiModels';
 import DevicePairing from './components/DevicePairing';
+import Finance from './components/Finance';
 import ProgressDisplay from './components/ProgressDisplay';
 import ModuleList from './components/ModuleList';
 import TestingPanel from './components/TestingPanel';
@@ -114,24 +116,11 @@ function App() {
         )}
 
         {activeTab === 'ai-models' && (
-          <section className="placeholder-section">
-            <h2>AI Models</h2>
-            <p>
-              No AI models loaded. Zelara Core will support ONNX and GGUF models
-              for on-device inference in a future release. Models will appear here
-              once downloaded.
-            </p>
-          </section>
+          <AiModels />
         )}
 
         {activeTab === 'finance' && (
-          <section className="placeholder-section">
-            <h2>Finance</h2>
-            <p>
-              Zelara Finance is a standalone app. Download it to manage your
-              finances, track spending, and get AI-powered insights.
-            </p>
-          </section>
+          <Finance />
         )}
 
         {activeTab === 'settings' && (

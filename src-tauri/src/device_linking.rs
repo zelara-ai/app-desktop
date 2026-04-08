@@ -14,6 +14,7 @@ use tauri::{Emitter, State};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::{sleep, Duration};
 use tokio_rustls::TlsAcceptor;
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
@@ -72,10 +73,38 @@ pub struct ImageProcessingState {
     pub processed_mime: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FinanceContextCategory {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub color: String,
+    pub budget_limit: Option<f64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FinanceContextHistoryEntry {
+    pub description: String,
+    pub merchant_name: Option<String>,
+    pub category: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct FinanceContextSnapshot {
+    pub categories: Vec<FinanceContextCategory>,
+    pub history: Vec<FinanceContextHistoryEntry>,
+    pub synced_at: String,
+}
+
 /// Shared registry of per-connection push senders (keyed by remote_addr).
 /// Used by `broadcast_progress_sync` to push progress updates to all Mobile clients.
 type ClientSenders = Arc<Mutex<HashMap<String, UnboundedSender<Message>>>>;
 type LatestImageProcessing = Arc<Mutex<Option<ImageProcessingState>>>;
+type LatestFinanceContext = Arc<Mutex<Option<FinanceContextSnapshot>>>;
 
 pub struct DeviceLinkingState {
     pub linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
@@ -83,6 +112,7 @@ pub struct DeviceLinkingState {
     pub server_running: Arc<Mutex<bool>>,
     pub client_senders: ClientSenders,
     pub latest_image_processing: LatestImageProcessing,
+    pub latest_finance_context: LatestFinanceContext,
 }
 
 impl DeviceLinkingState {
@@ -93,6 +123,7 @@ impl DeviceLinkingState {
             server_running: Arc::new(Mutex::new(false)),
             client_senders: Arc::new(Mutex::new(HashMap::new())),
             latest_image_processing: Arc::new(Mutex::new(None)),
+            latest_finance_context: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -417,6 +448,8 @@ pub fn add_linked_device(
 pub async fn start_pairing_server(
     app_handle: tauri::AppHandle,
     state: State<'_, DeviceLinkingState>,
+    ai_state: State<'_, std::sync::Arc<crate::ai::AiRuntimeState>>,
+    receipt_state: State<'_, std::sync::Arc<crate::receipt_queue::ReceiptQueueState>>,
 ) -> Result<(), String> {
     // Check if server is already running
     {
@@ -470,6 +503,10 @@ pub async fn start_pairing_server(
     let linked_devices = state.linked_devices.clone();
     let client_senders = state.client_senders.clone();
     let latest_image_processing = state.latest_image_processing.clone();
+    let latest_finance_context = state.latest_finance_context.clone();
+    let progress_tx = ai_state.progress_tx.clone();
+    let ai_arc = std::sync::Arc::clone(&*ai_state);
+    let receipt_arc = std::sync::Arc::clone(&*receipt_state);
 
     // Spawn server task
     tokio::spawn(async move {
@@ -481,7 +518,11 @@ pub async fn start_pairing_server(
             linked_devices,
             client_senders,
             latest_image_processing,
+            latest_finance_context,
             app_handle,
+            progress_tx,
+            ai_arc,
+            receipt_arc,
         )
         .await
         {
@@ -500,7 +541,11 @@ async fn run_websocket_server(
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     client_senders: ClientSenders,
     latest_image_processing: LatestImageProcessing,
+    latest_finance_context: LatestFinanceContext,
     app_handle: tauri::AppHandle,
+    progress_tx: tokio::sync::broadcast::Sender<crate::ai::DownloadProgressEvent>,
+    ai_state: std::sync::Arc<crate::ai::AiRuntimeState>,
+    receipt_state: std::sync::Arc<crate::receipt_queue::ReceiptQueueState>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
@@ -521,6 +566,10 @@ async fn run_websocket_server(
                 let acceptor = tls_acceptor.clone();
                 let senders = client_senders.clone();
                 let latest_processing = latest_image_processing.clone();
+                let latest_finance_context = latest_finance_context.clone();
+                let conn_progress_tx = progress_tx.clone();
+                let conn_ai = std::sync::Arc::clone(&ai_state);
+                let conn_receipt = std::sync::Arc::clone(&receipt_state);
 
                 tokio::spawn(async move {
                     // Wrap TCP stream with TLS
@@ -533,8 +582,12 @@ async fn run_websocket_server(
                                     devices,
                                     senders,
                                     latest_processing,
+                                    latest_finance_context,
                                     remote_addr,
                                     handle,
+                                    conn_progress_tx,
+                                    conn_ai,
+                                    conn_receipt,
                                 )
                                 .await
                                 {
@@ -628,14 +681,70 @@ fn rebroadcast_latest_image_processing_state(
     }
 }
 
+fn finance_context_request_message() -> Option<Message> {
+    serde_json::to_string(&serde_json::json!({
+        "type": "finance_context_request",
+    }))
+    .ok()
+    .map(Message::Text)
+}
+
+fn publish_finance_context_snapshot(
+    latest_finance_context: &LatestFinanceContext,
+    app_handle: &tauri::AppHandle,
+    snapshot: FinanceContextSnapshot,
+) {
+    *latest_finance_context.lock().unwrap() = Some(snapshot.clone());
+    let _ = app_handle.emit("finance-context-updated", &snapshot);
+}
+
+fn receipt_queue_update_message(job: &crate::receipt_queue::ReceiptJob) -> Option<Message> {
+    serde_json::to_string(&serde_json::json!({
+        "type": "receipt_queue_update",
+        "job": job,
+    }))
+    .ok()
+    .map(Message::Text)
+}
+
+fn receipt_queue_snapshot_message(jobs: &[crate::receipt_queue::ReceiptJob]) -> Option<Message> {
+    serde_json::to_string(&serde_json::json!({
+        "type": "receipt_queue_snapshot",
+        "jobs": jobs,
+    }))
+    .ok()
+    .map(Message::Text)
+}
+
+fn publish_receipt_job_update(
+    receipt_state: &crate::receipt_queue::ReceiptQueueState,
+    client_senders: &ClientSenders,
+    app_handle: &tauri::AppHandle,
+    job: &crate::receipt_queue::ReceiptJob,
+) {
+    let _ = app_handle.emit("receipt-job-updated", job);
+    let _ = app_handle.emit("receipt-jobs-updated", receipt_state.list_jobs());
+
+    if let Some(message) = receipt_queue_update_message(job) {
+        let senders = client_senders.lock().unwrap();
+        for sender in senders.values() {
+            let _ = sender.send(message.clone());
+        }
+    }
+}
+
 async fn handle_websocket_connection<S>(
     ws_stream: tokio_tungstenite::WebSocketStream<S>,
     expected_token: Option<String>,
     linked_devices: Arc<Mutex<Vec<DeviceInfo>>>,
     client_senders: ClientSenders,
     latest_image_processing: LatestImageProcessing,
+    latest_finance_context: LatestFinanceContext,
     remote_addr: String,
     app_handle: tauri::AppHandle,
+    progress_tx: tokio::sync::broadcast::Sender<crate::ai::DownloadProgressEvent>,
+    ai_state: std::sync::Arc<crate::ai::AiRuntimeState>,
+    receipt_state: std::sync::Arc<crate::receipt_queue::ReceiptQueueState>,
 ) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -656,12 +765,18 @@ where
     // Per-connection push channel: broadcast_progress_sync enqueues messages here;
     // Arm 3 of the select loop drains them and writes to the WebSocket.
     let (push_tx, mut push_rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    // Keep a clone for use in spawned tasks (ai_task async dispatch result).
+    let push_tx_self = push_tx.clone();
     {
         client_senders
             .lock()
             .unwrap()
             .insert(remote_addr.clone(), push_tx);
     }
+
+    // Subscribe to the AI model download progress broadcast.
+    // Each connected mobile client gets its own receiver so all get the same events.
+    let mut progress_rx = progress_tx.subscribe();
 
     'outer: loop {
         tokio::select! {
@@ -857,6 +972,7 @@ where
                                 discovery_method: method_label.to_string(),
                             };
 
+                            {
                             let mut devices = linked_devices.lock().unwrap();
                             // Deduplicate by stable device ID — if same device reconnects, replace the old entry.
                             if let Some(existing) = devices.iter_mut().find(|d| d.id == device.id) {
@@ -867,6 +983,8 @@ where
                                 devices.push(device.clone());
                                 println!("Registered mobile device: {} ({}) via {}", stable_id, remote_addr, method_label);
                                 let _ = app_handle.emit("device-linked", &device);
+                            }
+                            drop(devices);
                             }
                             registered_device_id = Some(stable_id);
                             device_registered = true;
@@ -879,6 +997,15 @@ where
                                 &latest_image_processing,
                                 &client_senders,
                             );
+                            if let Some(snapshot_msg) =
+                                receipt_queue_snapshot_message(&receipt_state.list_jobs())
+                            {
+                                let _ = write.send(snapshot_msg).await;
+                            }
+                            if let Some(finance_context_request) = finance_context_request_message()
+                            {
+                                let _ = write.send(finance_context_request).await;
+                            }
                         }
 
                         // Process task based on type
@@ -983,22 +1110,173 @@ where
                                     }
                                 }
                             }
+                            "finance_context_sync" => {
+                                let categories = request
+                                    .payload
+                                    .get("categories")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([]));
+                                let history = request
+                                    .payload
+                                    .get("history")
+                                    .cloned()
+                                    .unwrap_or_else(|| serde_json::json!([]));
+                                let synced_at = request
+                                    .payload
+                                    .get("syncedAt")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_else(|| request.timestamp.as_str())
+                                    .to_string();
+
+                                match (
+                                    serde_json::from_value::<Vec<FinanceContextCategory>>(categories),
+                                    serde_json::from_value::<Vec<FinanceContextHistoryEntry>>(history),
+                                ) {
+                                    (Ok(categories), Ok(history)) => {
+                                        let snapshot = FinanceContextSnapshot {
+                                            categories,
+                                            history,
+                                            synced_at,
+                                        };
+                                        publish_finance_context_snapshot(
+                                            &latest_finance_context,
+                                            &app_handle,
+                                            snapshot,
+                                        );
+                                        TaskResponse {
+                                            task_id: request.task_id,
+                                            success: true,
+                                            result: serde_json::json!({ "message": "Finance context synced" }),
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                        }
+                                    }
+                                    (Err(error), _) | (_, Err(error)) => TaskResponse {
+                                        task_id: request.task_id,
+                                        success: false,
+                                        result: serde_json::json!({ "error": format!("Invalid finance context payload: {error}") }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    },
+                                }
+                            }
+                            "receipt_capture" => {
+                                let receipt_id = request
+                                    .payload
+                                    .get("receiptId")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or(&request.task_id)
+                                    .to_string();
+                                let device_id = request
+                                    .payload
+                                    .get("deviceId")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("unknown-device")
+                                    .to_string();
+                                let captured_at = request
+                                    .payload
+                                    .get("capturedAt")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or_else(|| request.timestamp.as_str())
+                                    .to_string();
+                                let mime_type = request
+                                    .payload
+                                    .get("mimeType")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("image/jpeg")
+                                    .to_string();
+                                let image_base64 = request
+                                    .payload
+                                    .get("imageBase64")
+                                    .and_then(|value| value.as_str())
+                                    .unwrap_or("")
+                                    .to_string();
+
+                                let capture_quality: crate::receipt_queue::ReceiptCaptureQuality =
+                                    serde_json::from_value(
+                                        request
+                                            .payload
+                                            .get("captureQuality")
+                                            .cloned()
+                                            .unwrap_or_else(|| serde_json::json!({})),
+                                    )
+                                    .unwrap_or_default();
+
+                                match receipt_state.save_uploaded_job(
+                                    receipt_id.clone(),
+                                    device_id,
+                                    captured_at,
+                                    mime_type,
+                                    image_base64,
+                                    capture_quality,
+                                ) {
+                                    Ok(job) => {
+                                        publish_receipt_job_update(
+                                            &*receipt_state,
+                                            &client_senders,
+                                            &app_handle,
+                                            &job,
+                                        );
+                                        start_receipt_processing_loop(
+                                            std::sync::Arc::clone(&receipt_state),
+                                            std::sync::Arc::clone(&ai_state),
+                                            client_senders.clone(),
+                                            app_handle.clone(),
+                                        );
+                                        TaskResponse {
+                                            task_id: request.task_id,
+                                            success: true,
+                                            result: serde_json::json!({
+                                                "message": "Receipt queued",
+                                                "receiptId": receipt_id,
+                                                "status": job.status,
+                                            }),
+                                            timestamp: chrono::Utc::now().to_rfc3339(),
+                                        }
+                                    }
+                                    Err(error) => TaskResponse {
+                                        task_id: request.task_id,
+                                        success: false,
+                                        result: serde_json::json!({ "error": error }),
+                                        timestamp: chrono::Utc::now().to_rfc3339(),
+                                    },
+                                }
+                            }
                             "ai_task" => {
                                 let ai_request = crate::ai::AiTaskRequest {
                                     task_id: request.task_id.clone(),
                                     capability: request.capability.clone().unwrap_or_default(),
                                     payload: request.payload.clone(),
                                 };
-                                let ai_response = crate::ai::dispatcher::dispatch(ai_request);
-                                TaskResponse {
-                                    task_id: ai_response.task_id,
-                                    success: ai_response.success,
-                                    result: serde_json::json!({
+                                // Dispatch is async (may download models); run in a spawned task
+                                // so the message loop is not blocked. Result is sent back over
+                                // this connection's push channel (Arm 3 writes it to the socket).
+                                let self_push = push_tx_self.clone();
+                                let handle = app_handle.clone();
+                                let dispatch_ai = std::sync::Arc::clone(&ai_state);
+                                tokio::spawn(async move {
+                                    let ai_response = crate::ai::dispatcher::dispatch(
+                                        ai_request,
+                                        &*dispatch_ai,
+                                        &handle,
+                                    )
+                                    .await;
+                                    let result_msg = serde_json::json!({
+                                        "task_id": ai_response.task_id,
                                         "type": "ai_task_result",
+                                        "success": ai_response.success,
                                         "capability": ai_response.capability,
                                         "result": ai_response.result,
                                         "error": ai_response.error,
-                                    }),
+                                        "download_progress": ai_response.download_progress,
+                                    });
+                                    if let Ok(text) = serde_json::to_string(&result_msg) {
+                                        let _ = self_push.send(Message::Text(text));
+                                    }
+                                });
+                                // Immediate ack — real result arrives via push channel
+                                TaskResponse {
+                                    task_id: request.task_id,
+                                    success: true,
+                                    result: serde_json::json!({ "type": "ai_task_queued" }),
                                     timestamp: chrono::Utc::now().to_rfc3339(),
                                 }
                             }
@@ -1089,10 +1367,32 @@ where
                 }
             }
 
-            // ── Arm 3: outbound push messages (progress_sync, etc.) ─────────
+            // ── Arm 3: outbound push messages (progress_sync, ai_task_result, etc.) ─
             Some(msg) = push_rx.recv() => {
                 if write.send(msg).await.is_err() {
                     break 'outer;
+                }
+            }
+
+            // ── Arm 4: AI model download progress → push to this client ────
+            Ok(evt) = progress_rx.recv() => {
+                let msg_type = if evt.progress >= 1.0 {
+                    "model_ready"
+                } else if evt.progress < 0.0 {
+                    "model_download_error"
+                } else {
+                    "model_download_progress"
+                };
+                let payload = serde_json::json!({
+                    "type": msg_type,
+                    "capability": evt.capability,
+                    "model_id": evt.model_id,
+                    "progress": if evt.progress < 0.0 { serde_json::Value::Null } else { serde_json::json!(evt.progress) },
+                });
+                if let Ok(text) = serde_json::to_string(&payload) {
+                    if write.send(Message::Text(text)).await.is_err() {
+                        break 'outer;
+                    }
                 }
             }
         }
@@ -1399,11 +1699,465 @@ async fn send_binary_result<S>(
     );
 }
 
+fn start_receipt_processing_loop(
+    receipt_state: std::sync::Arc<crate::receipt_queue::ReceiptQueueState>,
+    ai_state: std::sync::Arc<crate::ai::AiRuntimeState>,
+    client_senders: ClientSenders,
+    app_handle: tauri::AppHandle,
+) {
+    {
+        let mut processing = receipt_state.processing.lock().unwrap();
+        if *processing {
+            return;
+        }
+        *processing = true;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        'jobs: loop {
+            // Stop the loop cleanly on app shutdown.
+            if receipt_state.is_shutdown() {
+                *receipt_state.processing.lock().unwrap() = false;
+                break;
+            }
+
+            let Some(job) = receipt_state.next_pending_job() else {
+                *receipt_state.processing.lock().unwrap() = false;
+                break;
+            };
+
+            // Permanently fail jobs that have exceeded the retry cap.
+            if job.retry_count >= crate::receipt_queue::MAX_JOB_RETRIES {
+                eprintln!(
+                    "[ReceiptQueue] Job {} exceeded max retries ({}); marking as permanently failed",
+                    job.receipt_id,
+                    crate::receipt_queue::MAX_JOB_RETRIES
+                );
+                let _ = receipt_state.update_job(&job.receipt_id, |current| {
+                    current.status = "failed".to_string();
+                    current.error = Some("max_retries_exceeded".to_string());
+                });
+                if let Ok(Some(snapshot)) = receipt_state.update_job(&job.receipt_id, |_| {}) {
+                    publish_receipt_job_update(
+                        &*receipt_state,
+                        &client_senders,
+                        &app_handle,
+                        &snapshot,
+                    );
+                }
+                continue 'jobs;
+            }
+
+            if let Ok(Some(snapshot)) = receipt_state.update_job(&job.receipt_id, |current| {
+                current.status = "running".to_string();
+                current.error = None;
+            }) {
+                publish_receipt_job_update(
+                    &*receipt_state,
+                    &client_senders,
+                    &app_handle,
+                    &snapshot,
+                );
+            }
+
+            let queue_started = std::time::Instant::now();
+
+            loop {
+                // Honour shutdown between model-poll ticks.
+                if receipt_state.is_shutdown() {
+                    *receipt_state.processing.lock().unwrap() = false;
+                    break 'jobs;
+                }
+
+                match crate::ai::model_manager::ensure_capability_ready(
+                    "ocr_receipt",
+                    &*ai_state,
+                    &app_handle,
+                )
+                .await
+                {
+                    crate::ai::model_manager::CapabilityStatus::Ready => break,
+                    crate::ai::model_manager::CapabilityStatus::Downloading(progress) => {
+                        if let Ok(Some(snapshot)) =
+                            receipt_state.update_job(&job.receipt_id, |current| {
+                                current.status = "waiting_for_model".to_string();
+                                current.stage_timings = serde_json::json!({
+                                    "waitForModelMs": queue_started.elapsed().as_millis() as u64,
+                                    "downloadProgress": progress,
+                                });
+                            })
+                        {
+                            publish_receipt_job_update(
+                                &receipt_state,
+                                &client_senders,
+                                &app_handle,
+                                &snapshot,
+                            );
+                        }
+                        sleep(Duration::from_millis(700)).await;
+                    }
+                    crate::ai::model_manager::CapabilityStatus::Failed(message) => {
+                        if let Ok(Some(snapshot)) =
+                            receipt_state.update_job(&job.receipt_id, |current| {
+                                current.status = "failed".to_string();
+                                current.error = Some(message.clone());
+                                current.retry_count += 1;
+                            })
+                        {
+                            publish_receipt_job_update(
+                                &receipt_state,
+                                &client_senders,
+                                &app_handle,
+                                &snapshot,
+                            );
+                        }
+                        continue 'jobs;
+                    }
+                }
+            }
+
+            let ai_request = crate::ai::AiTaskRequest {
+                task_id: job.receipt_id.clone(),
+                capability: "ocr_receipt".to_string(),
+                payload: serde_json::json!({
+                    "imagePath": job.image_path,
+                    "mimeType": job.mime_type,
+                    "receiptId": job.receipt_id,
+                    "captureQuality": job.capture_quality,
+                }),
+            };
+
+            let process_started = std::time::Instant::now();
+            let response =
+                crate::ai::dispatcher::dispatch(ai_request, &*ai_state, &app_handle).await;
+
+            match response {
+                crate::ai::AiTaskResponse {
+                    success: true,
+                    result: Some(result),
+                    ..
+                } => {
+                    let status = result["status"]
+                        .as_str()
+                        .unwrap_or("needs_review")
+                        .to_string();
+                    let updated = receipt_state.update_job(&job.receipt_id, |current| {
+                        current.status = status.clone();
+                        current.error = None;
+                        current.ocr_result = Some(result.clone());
+                        current.review_reason = result["reviewReason"]
+                            .as_str()
+                            .map(|value| value.to_string());
+                        current.review_fields = result["reviewFields"]
+                            .as_array()
+                            .map(|values| {
+                                values
+                                    .iter()
+                                    .filter_map(|value| {
+                                        value.as_str().map(|value| value.to_string())
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        current.readiness_score = result["readinessScore"].as_f64();
+                        current.field_confidence = result.get("fieldConfidence").cloned();
+                        current.field_evidence = result.get("fieldEvidence").cloned();
+                        current.field_suggestions = result.get("fieldSuggestions").cloned();
+                        current.processing_trace = Some(serde_json::json!({
+                            "ocrTrace": result.get("ocrTrace").cloned(),
+                            "qwenFallback": result.get("qwenFallback").cloned(),
+                        }));
+                        current.stage_timings = merge_stage_timings(
+                            result.get("stageTimings").cloned(),
+                            queue_started.elapsed().as_millis() as u64,
+                            process_started.elapsed().as_millis() as u64,
+                        );
+                        current.draft = Some(crate::receipt_queue::ReceiptDraft {
+                            amount: result["total"].as_f64().unwrap_or(0.0),
+                            currency: "EUR".to_string(),
+                            description: result["description"]
+                                .as_str()
+                                .or_else(|| result["merchant"].as_str())
+                                .unwrap_or("Receipt")
+                                .to_string(),
+                            merchant: result["merchant"].as_str().map(|value| value.to_string()),
+                            date: result["date"].as_str().map(|value| value.to_string()),
+                            category_id: result["categoryId"]
+                                .as_str()
+                                .map(|value| value.to_string()),
+                        });
+                    });
+                    if let Ok(Some(snapshot)) = updated {
+                        publish_receipt_job_update(
+                            &receipt_state,
+                            &client_senders,
+                            &app_handle,
+                            &snapshot,
+                        );
+                    }
+
+                    // Spawn background Qwen3 refinement if the heuristic result needs it.
+                    // Runs after the job is already marked completed so the UX is instant.
+                    if result
+                        .get("qwenNeeded")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        let raw_text = result["rawText"].as_str().unwrap_or("").to_string();
+                        let merchant_hint = result["merchant"].as_str().map(|s| s.to_string());
+                        let date_hint = result["date"].as_str().map(|s| s.to_string());
+                        let total_hint = result["total"].as_f64().filter(|&t| t != 0.0);
+                        let confidence_hint = result["confidence"].as_f64().unwrap_or(0.0);
+                        let used_total_fallback = result
+                            .get("usedTotalFallback")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(true);
+                        let receipt_id_bg = job.receipt_id.clone();
+                        let ai_state_bg = std::sync::Arc::clone(&ai_state);
+                        let receipt_state_bg = std::sync::Arc::clone(&receipt_state);
+                        let client_senders_bg = client_senders.clone();
+                        let app_handle_bg = app_handle.clone();
+
+                        tokio::spawn(async move {
+                            println!(
+                                "[QwenReceipt][{receipt_id_bg}] Background refinement started"
+                            );
+                            let input = crate::ai::qwen_receipt::QwenReceiptInput {
+                                raw_text: &raw_text,
+                                merchant: merchant_hint.as_deref(),
+                                date: date_hint.as_deref(),
+                                total: total_hint,
+                                confidence: confidence_hint,
+                                used_total_fallback,
+                            };
+                            match crate::ai::qwen_receipt::refine_receipt_text(
+                                &*ai_state_bg,
+                                &input,
+                            )
+                            .await
+                            {
+                                Ok(suggestion) => {
+                                    // Prefer description as merchant when it's cleaner than the raw merchant field.
+                                    // Qwen3 often puts the clean store name in `description` (e.g. "Dollar Tree")
+                                    // even when `merchant` still carries the full OCR address line.
+                                    let clean_merchant = suggestion
+                                        .merchant
+                                        .as_deref()
+                                        .filter(|m| !m.is_empty())
+                                        .or(suggestion
+                                            .description
+                                            .as_deref()
+                                            .filter(|d| !d.is_empty()))
+                                        .map(|s| s.to_string());
+                                    println!(
+                                        "[QwenReceipt][{receipt_id_bg}] Background refined => merchant={:?} total={:?}",
+                                        clean_merchant, suggestion.total
+                                    );
+                                    let refined =
+                                        receipt_state_bg.update_job(&receipt_id_bg, |current| {
+                                            if let Some(ref mut draft) = current.draft {
+                                                if let Some(ref m) = clean_merchant {
+                                                    draft.merchant = Some(m.clone());
+                                                    draft.description = format!("{m} receipt");
+                                                }
+                                                if let Some(t) = suggestion.total {
+                                                    if t > 0.0 {
+                                                        draft.amount = t;
+                                                    }
+                                                }
+                                                if let Some(ref d) = suggestion.date {
+                                                    if !d.is_empty() {
+                                                        draft.date = Some(d.clone());
+                                                    }
+                                                }
+                                            }
+                                            if let Some(obj) = current.stage_timings.as_object_mut()
+                                            {
+                                                obj.insert(
+                                                    "qwenRefinedAt".to_string(),
+                                                    serde_json::Value::String(
+                                                        chrono::Utc::now().to_rfc3339(),
+                                                    ),
+                                                );
+                                            }
+                                        });
+                                    if let Ok(Some(refined_snapshot)) = refined {
+                                        publish_receipt_job_update(
+                                            &receipt_state_bg,
+                                            &client_senders_bg,
+                                            &app_handle_bg,
+                                            &refined_snapshot,
+                                        );
+                                        let _ = app_handle_bg.emit(
+                                            "receipt-refined",
+                                            serde_json::json!({
+                                                "receiptId": receipt_id_bg,
+                                                "merchant": suggestion.merchant,
+                                                "total": suggestion.total,
+                                                "date": suggestion.date,
+                                                "confidence": suggestion.confidence,
+                                            }),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[QwenReceipt][{receipt_id_bg}] Background refinement failed: {e}");
+                                }
+                            }
+                        });
+                    }
+                }
+                failed => {
+                    let error = failed
+                        .error
+                        .unwrap_or_else(|| "receipt_processing_failed".to_string());
+                    if let Ok(Some(snapshot)) =
+                        receipt_state.update_job(&job.receipt_id, |current| {
+                            current.status = "failed".to_string();
+                            current.error = Some(error.clone());
+                            current.retry_count += 1;
+                            current.stage_timings = serde_json::json!({
+                                "queuedMs": queue_started.elapsed().as_millis() as u64,
+                                "processingMs": process_started.elapsed().as_millis() as u64,
+                            });
+                        })
+                    {
+                        publish_receipt_job_update(
+                            &receipt_state,
+                            &client_senders,
+                            &app_handle,
+                            &snapshot,
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+pub fn resume_receipt_processing_loop(
+    receipt_state: std::sync::Arc<crate::receipt_queue::ReceiptQueueState>,
+    ai_state: std::sync::Arc<crate::ai::AiRuntimeState>,
+    client_senders: ClientSenders,
+    app_handle: tauri::AppHandle,
+) {
+    start_receipt_processing_loop(receipt_state, ai_state, client_senders, app_handle);
+}
+
+fn merge_stage_timings(
+    stage_timings: Option<serde_json::Value>,
+    queued_ms: u64,
+    processing_ms: u64,
+) -> serde_json::Value {
+    let mut map = stage_timings
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    map.insert("queuedMs".to_string(), serde_json::json!(queued_ms));
+    map.insert("processingMs".to_string(), serde_json::json!(processing_ms));
+    serde_json::Value::Object(map)
+}
+
 #[tauri::command]
 pub fn get_latest_image_processing_state(
     state: State<DeviceLinkingState>,
 ) -> Option<ImageProcessingState> {
     state.latest_image_processing.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn get_finance_context(state: State<DeviceLinkingState>) -> Option<FinanceContextSnapshot> {
+    state.latest_finance_context.lock().unwrap().clone()
+}
+
+#[tauri::command]
+pub fn request_finance_context_sync(state: State<DeviceLinkingState>) -> Result<usize, String> {
+    let senders = state.client_senders.lock().unwrap();
+    let count = senders.len();
+    if count == 0 {
+        return Ok(0);
+    }
+
+    if let Some(message) = finance_context_request_message() {
+        for sender in senders.values() {
+            let _ = sender.send(message.clone());
+        }
+    }
+
+    Ok(count)
+}
+
+#[tauri::command]
+pub fn send_receipt_job_to_mobile(
+    receipt_id: String,
+    amount: f64,
+    description: String,
+    merchant: Option<String>,
+    date: Option<String>,
+    category_id: Option<String>,
+    receipt_state: State<'_, std::sync::Arc<crate::receipt_queue::ReceiptQueueState>>,
+    device_state: State<'_, DeviceLinkingState>,
+    app_handle: tauri::AppHandle,
+) -> Result<usize, String> {
+    let senders = device_state.client_senders.lock().unwrap();
+    if senders.is_empty() {
+        return Err("No mobile clients are currently connected.".to_string());
+    }
+
+    let transaction = crate::finance_import::ImportedTransaction {
+        date: date.unwrap_or_else(|| chrono::Utc::now().date_naive().to_string()),
+        description,
+        amount,
+        currency: "EUR".to_string(),
+        merchant,
+        source_format: "ocr".to_string(),
+    };
+    let transaction_date = transaction.date.clone();
+    let transaction_description = transaction.description.clone();
+    let transaction_currency = transaction.currency.clone();
+    let transaction_merchant = transaction.merchant.clone();
+    let category_for_payload = category_id.clone();
+    let receipt_id_for_payload = receipt_id.clone();
+    let payload = serde_json::json!({
+        "type": "finance_sync_push",
+        "transactions": [{
+            "date": transaction_date,
+            "description": transaction_description,
+            "amount": transaction.amount,
+            "currency": transaction_currency,
+            "merchant": transaction_merchant,
+            "source": "ocr",
+            "categoryId": category_for_payload,
+            "receiptId": receipt_id_for_payload,
+        }],
+    });
+    let text = serde_json::to_string(&payload)
+        .map_err(|error| format!("Failed to serialize receipt draft: {error}"))?;
+
+    for sender in senders.values() {
+        let _ = sender.send(Message::Text(text.clone().into()));
+    }
+    drop(senders);
+
+    if let Ok(Some(snapshot)) = receipt_state.update_job(&receipt_id, |current| {
+        if let Some(draft) = current.draft.as_mut() {
+            draft.amount = amount;
+            draft.description = transaction.description.clone();
+            draft.merchant = transaction.merchant.clone();
+            draft.date = Some(transaction.date.clone());
+            draft.category_id = category_id.clone();
+        }
+        current.status = "saved".to_string();
+        current.error = None;
+    }) {
+        publish_receipt_job_update(
+            &receipt_state,
+            &device_state.client_senders,
+            &app_handle,
+            &snapshot,
+        );
+    }
+
+    Ok(device_state.client_senders.lock().unwrap().len())
 }
 
 #[tauri::command]
